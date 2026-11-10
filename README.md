@@ -8,6 +8,20 @@
 当前进度与交接记录见 [docs/PROGRESS.md](docs/PROGRESS.md)，任务清单见 [docs/TODO.md](docs/TODO.md)，
 已验证的坑位见 [docs/tech_notes.md](docs/tech_notes.md)。
 
+## 界面展示
+
+360×360 圆形屏的实际状态机画面（主机仿真渲染，字体与图片直接取自固件生成资源）：
+
+| 待机 | 聆听 | 思考 | 说话（底部 1/4 字幕） |
+|:---:|:---:|:---:|:---:|
+| <img src="docs/images/ui-idle.png" width="180" alt="待机"> | <img src="docs/images/ui-listening.png" width="180" alt="聆听"> | <img src="docs/images/ui-thinking.png" width="180" alt="思考"> | <img src="docs/images/ui-speaking.png" width="180" alt="说话"> |
+| **未听清** | **网络断开** | **低电提示** | **睡眠** |
+| <img src="docs/images/ui-error.png" width="180" alt="未听清"> | <img src="docs/images/ui-offline.png" width="180" alt="网络断开"> | <img src="docs/images/ui-lowbat.png" width="180" alt="低电提示"> | <img src="docs/images/ui-sleep.png" width="180" alt="睡眠"> |
+
+> 字幕固定在屏幕下 1/4（y=270..318），状态/Toast 保持在圆形安全半径内。
+> 低电屏的百分比当前为示例文案，电池 ADC 补焊后改为实时值。
+> 快捷设置、个性化、时间天气等菜单页可在本地浏览器仿真中逐页查看（见下方“浏览器仿真”）。
+
 ## 目录
 
 ```
@@ -36,7 +50,7 @@ cd panda_ai
 idf.py build
 ```
 
-当前产物约 8.0MB（`0x804540`，固件版本 2.0.0），factory 分区剩余约 20%。
+当前产物约 8.0MB（`0x804590`，固件版本 2.0.0），factory 分区剩余约 20%。
 
 主机侧自检（不需要设备）：
 
