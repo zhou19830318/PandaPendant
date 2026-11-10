@@ -1,0 +1,49 @@
+menu "Panda AI"
+
+    config PANDA_BATTERY_ADC
+        bool "Enable battery voltage measurement on GPIO1"
+        default n
+        help
+            The board schematic (1.1) routes BAT_ADC to GPIO1 only when the
+            0R links at R53/R78 are fitted; they are unpopulated by default,
+            so GPIO1 floats. Fitting them makes camera HREF unavailable.
+
+    config PANDA_BATTERY_DIVIDER_MILLI
+        int "Battery divider ratio x1000 (Vbat / Vadc)"
+        default 3000
+        depends on PANDA_BATTERY_ADC
+        help
+            Schematic 1.1 divides BAT_OUT with R2=200K (upper) and R11=100K
+            (lower), so Vbat = Vadc x 3. BAT_OUT is the selected system rail
+            and reads about 5 V while USB is plugged in.
+
+    config PANDA_DEBUG_VERBOSE
+        bool "Verbose debug logs and periodic diagnostics"
+        default y
+
+    config PANDA_UI_FPS
+        int "UI target FPS"
+        range 10 60
+        default 30
+
+    config PANDA_SERIAL_CLI
+        bool "Enable USB-SERIAL-JTAG serial command line"
+        default y
+
+    config PANDA_PROVISIONING
+        bool "Enable HTTP provisioning page on port 80"
+        default y
+
+    config PANDA_WIFI_AP_PREFIX
+        string "Provisioning SoftAP SSID prefix"
+        default "Panda-AI"
+
+    config PANDA_WIFI_AP_PASSWORD
+        string "Provisioning SoftAP password (>=8 chars, empty for open)"
+        default "pandapanda"
+
+    config PANDA_SNTP_SERVER
+        string "SNTP server for RTC sync"
+        default "pool.ntp.org"
+
+endmenu

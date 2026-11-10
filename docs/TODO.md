@@ -1,0 +1,401 @@
+# Panda AI 开发 TODO / 进展
+
+> 协作规则见根目录 [AGENTS.md](../AGENTS.md)：开工前读 [PROGRESS.md](PROGRESS.md)，收工前必须验证并更新
+> 本文件、`PROGRESS.md`、`tech_notes.md`。`[x]` 只用于有验证证据的项。
+> 当前硬件：串口 `/dev/ttyACM0` 已连接；电池 + SD 卡在位；屏幕、触摸、喇叭已连接
+> （2026-11-10 实测：ST77916/CST816S/I2S 均正常）；电池 ADC 的 R53/R78 0R 未焊。
+> 构建与验证基线见 `PROGRESS.md` 第 6 节。
+
+## 状态图例
+
+- [ ] 未开始
+- [~] 代码完成/编译通过，尚未完整验证（须写明缺口）
+- [x] 已完成并有验证证据
+- [!] 阻塞
+
+## 当前构建状态（2026-11-10）
+
+- `idf.py build` 通过：`panda_ai.bin` 0x804590（约 8.0MB），factory 10MB 剩余约 20%；
+  `project(panda_ai VERSION 2.0.0)`。
+- 配网页改为按需运行：仅 SoftAP 开启时启动，SoftAP 关闭即停止；有凭证正常启动时
+  日志为 `provisioning page idle (use 'wifi ap on' when needed)`。
+- 串口 CLI 已接入：status/ui/touch/brightness/volume/battery/time/settings/voice/audio/weather/rgb/i2c/sdcard/rtc/wifi/heap/reboot；
+  `ui error asr|llm|tts|audio|network|auth|generic|clear` 可注入/清除错误屏；
+  `ui images` 可无屏检查 37 屏的图片解码（37 屏/71 对象/58 唯一/0 失败）；
+  `voice stats` 输出 WS/TTS 计数器，`wifi status` 增加 `ap_auto`/`reason`/`retry`；
+  `weather [show|refresh|set <city>]` 查询/刷新/设置天气城市；
+  `audio tone [seconds]` 连续 880Hz 音；`voice pump on|off` 开关上行静音泵（诊断用）。
+
+## 本轮：圆形屏边缘裁切修复（2026-11-10，已烧录）
+- [x] 审计 37 个生成屏：正文/列表/标题字形均在 r≈180 内（仅 11 个标题与 2 个
+  透明快捷设置文字靠近 172–180，无背景框，未裁切）；真正越界的是运行时 overlay。
+- [x] 重排 overlay（`panda_ui.c`）：toast 240 宽、top 64；状态 pill 200 宽、bottom 44；
+  字幕 pill 200 宽、bottom 42 → 盒体 y=270..318，严格落在屏幕下 1/4，四角
+  r≈170.4；字幕出现或屏自带底部 tip 时隐藏状态 pill，避免互相压字。
+- [x] 6 个带 tip 的生成屏（offline/reconnecting/asr/llm/tts/low_battery）tip 上移
+  8px（y 298→290），底部两角 r≈167。
+- [x] 主机仿真同步（`tools/ui_sim/web` + `pages.js` 重新生成）；圆形裁切开启后
+  字幕/状态/toast 均完整可见。
+- [x] 验证：`idf.py build` → 0x804590（20% free），烧录 `/dev/ttyACM0`；串口
+  `ui subtitle` → `I (12006) ui: subtitle 38B label=192x40 box=200x48 scroll=0`；
+  仿真 DOM 实测字幕 x=80,y=273,w=200,h=45，状态 pill hidden。
+- [~] 真机目视：像素级观感（圆角/边距/字幕滚动手感）待用户确认。
+
+## 本轮：电池 ADC 链路核查（2026-11-10，`[~]` 缺硬件补焊）
+
+- [x] 核对官方 1.1 原理图：BAT_ADC 分压为 R2=200K / R11=100K（Vbat=Vadc×3），
+  不是代码原先假设的 82K/110K（×1.745）；经 R53/R78 两个 0R 选择跳线接
+  GPIO1，默认 NC（注释：“默认不启用电池电压测量……摄像头将不可使用”）。
+- [x] 代码修正：ADC1_CH0(GPIO1)、分压比 3000；新增上电自检（内拉低后
+  ≥200 mV 才认为分压接通）；未接通时 `battery` 显示 unknown，不误报低电。
+- [x] 验证（未接通状态）：启动日志 `Battery sense not wired: GPIO1
+  pulldown=0 mV`；`status` → `battery : unknown (ADC not wired)`；
+  构建 0x804540，20% free，已烧录 `/dev/ttyACM0`。
+- [~] 真实电压/百分比：需补焊 R53(1-3) + R78(1-2) 后复测。
+  预期日志 `Battery ADC on GPIO1 (pulldown=... open=...)`，`battery` 在
+  3.0–4.2 V（电池供电）或约 5 V/100%（USB 供电，BAT_OUT 为 5 V）。
+
+## 本轮：对话中途断流根因修复（2026-11-10，已烧录验证）
+
+- [x] 复现：`voice clip` 两轮对话测试均失败；播放 1–5s 后 RX 停滞、`Could not lock`
+  连环报错、连接断开。先按 demo 对齐 WiFi/TCP 参数（STATIC_RX 6、RX_BA_WIN 6、
+  TCP 窗口 32KB→5.7KB、RECVMBOX 6、MAX_SOCKETS 16、WS buffer 4096、
+  network_timeout 10s），播放中断问题消失（4/4 轮完整播放）。
+- [x] 根因 1：`WEBSOCKET_EVENT_ERROR`（event 0）被当成断线处理。组件对每次
+  error 级日志都会发 ERROR 事件（含 500ms 发送超时），旧代码清 `s_ws_connected`、
+  停上行静音泵；服务端约 72s 后以 `AudioServerNoAudioInputTooLongError` 关闭会话。
+  修复：ERROR 仅 DEBUG 日志，不断会话；已用日志证据确认（断开后 ASR 数据仍在到达）。
+- [x] 根因 2：天气内部堆门槛 28KB 在新 WiFi 缓冲（内部堆稳定 ~19KB）下永远不满足，
+  每次 fetch 直接 `ESP_ERR_NO_MEM`，却被上报为“网络错误”；90s 内 3 次误触发
+  WiFi 恢复，主动断开并杀掉进行中的语音会话。修复：门槛降到 16KB；仅 `ESP_FAIL`
+  计入网络错误，内存不足只记日志。
+- [x] 根因 3：clip 上行单帧入队失败即提前 commit（<0.3s 音频），ASR 拿不到内容。
+  修复：入队失败重试，连续 ~4s（200 帧）才强制 commit。
+- [x] 组件补丁：`esp_websocket_client` 发送 poll 超时（`wlen==0 && errno==0`）
+  不再 `abort_connection`，仅丢该帧；避免一次 500ms 抖动杀掉整条会话。
+- [x] 验证（真机，音量 30%）：
+  - 12/12 轮 `voice clip` 全链路（ASR→TTS→`play drain complete`），0 次 WS 断开、
+    0 丢包（主机 1Hz ping）、0 次 `Could not lock`。
+  - 静置 90s：0/177 丢包，会话保持；静置后再 clip 仍正常。
+  - 天气恢复：`weather refresh` → `weather: Beijing 11°C 晴 (code 0)`，无误触发恢复。
+  - 堆：内部稳定 ~18.7–19.1KB，TLS 峰值最低 ~10.5KB；PSRAM ~7.35MB。
+- [~] 真人按键/语音 PTT 复测：合成 clip 已覆盖同一链路，仍需用户实际说话确认。
+- 风险：内部堆余量偏紧（最低 ~10KB）；组件补丁位于 `managed_components`，
+  依赖更新后可能被覆盖；`audio tone`/`voice pump` 为诊断命令，非产品功能。
+- `settings set` 新增：`personality`(0–2)、`feedback`(0–2)、`animation`(0–2)、
+  `auto_sleep_s`(0/60/300/600)、`wake_mode`(0–2)、`sleep_anim`(0/1)、`dnd`(0/1)、
+  `weather_city`（字符串）；保存后同步 UI 与硬件（人格提示词在下一轮对话生效）。
+- WiFi STA + SoftAP + 配网 HTTP + SNTP、JSON 语音链路已接入代码（见 M1/M3）。
+- SquareLine 37 屏已去重接入；生成 UI 负责导航，`app_core` 负责 PTT、双击电量、状态周期任务；
+  KEY3 菜单的控件已全部接到 `app_core` 钩子（NVS/音频/亮度/WiFi/休眠/天气）。
+- **真机连接（2026-11-10）**：电池 + SD 卡 + 1.85" 屏 + 喇叭 + 触摸。
+  触摸曾因 CST816S 自动休眠持续 NACK，已写 `0xFE=0x01` 关闭自动休眠并实测恢复
+  （`touch diag` 全 OK、长按 PTT 可用）。
+- 播放诊断：每 5s `play loop #N: ring/peak/nearclip`；事件日志 `play start/pause/resume`、
+  `DMA gap`、`playback underrun`、`play pause stall`、`play drain complete`、`playback canceled`。
+
+## 本轮：BOOT 长按 4s 进入配网（2026-11-10，已烧录）
+
+- [x] 冲突排查：GPIO0 只作 BOOT，未与外设复用；但它是 strapping 脚（复位时按住
+  会进下载模式），只能在运行后检测。BOOT 原为 600ms 长按 PTT，与 4s 配网冲突；
+  经确认改为 BOOT 专用于配网，PTT 只保留触摸长按。
+- [x] 实现：BOOT 长按阈值 4s（其余键 600ms）；AP 关→开启 SoftAP+配网页，
+  AP 已开→再按 4s 关闭；短按 toast“长按 4 秒进入配网”；休眠时按住会先唤醒再切换。
+  `serial_cli` 新增 `key boot [long]` 注入。
+- [x] 注入验证（真机）：`key boot` → `boot short: hold 4 s for provisioning`，无 PTT；
+  `key boot long` → `provisioning page enabled/ready`，`wifi status` 为 softap on /
+  provision on，主机 `curl http://192.168.x.x/api/status` 返回 200；
+  再 `key boot long` → `provisioning page disabled`、softap off。构建 `0x801640`。
+- [~] 物理按住 BOOT 4s 的时序验证：本次串口监听窗口内未检测到按压（可能无人操作）；
+  GPIO0 读取/去抖路径沿用原 PTT 轮询，需用户实际长按一次确认。
+
+## 上一轮：WiFi “假在线”检测与自动恢复（2026-11-10，已烧录验证）
+
+- [x] 定位“断网”根因：驱动保持 connected+IP，但 ARP/TCP 全部失败且无 disconnect 事件
+  （主机 ping 100% 丢包、`ip neigh` FAILED；内部堆稳定 ~44KB；配网页当时未运行）。
+  与 ESP-IDF #8123/#5717/#15704 同款，属 WiFi 驱动/射频 RX 路径卡死。证据见
+  `docs/tech_notes.md`“WiFi 假在线”。
+- [x] 自动恢复：WS 断连与天气失败 90s 内聚合 3 次 → `disconnect+connect`，
+  20s 无 IP → `stop/start`+`WIFI_PS_NONE`，45s 冷却；`esp_wifi_*` 全部移入 worker
+  任务（timer 回调只投队列），worker 栈放 PSRAM。实测故障 67s → 95.5s 触发 →
+  99.5s 恢复 IP，随后一轮语音回复与播放正常；完整回归 193.9s→199.3s 恢复。
+- [x] 新增 `wifi recover` 手动恢复命令（绕过冷却）；实测约 4s 恢复。
+- [~] 根除该卡死：未完成。恢复期间在途的那轮回复会丢失，故障仍偶发；候选后续：
+  对照 demo 压测 `STATIC_RX_BUFFER_NUM` 4→6 等射频缓冲差异。
+- [x] CLI 中文限制记录：`weather set 北京` 无效（linenoise 丢非 ASCII 字节），
+  改用拼音 `Beijing`；中文城市请走配网页 `/save`。
+
+## 上一轮：配网页按需开启 / 字幕 2 行滚动 / WS 锁补丁（2026-11-10，已烧录）
+
+- [x] 配网页按需开启：`app_main.c` 有凭证时不再启动 HTTP；`app_core.c` 在 SoftAP
+  上升沿 start、下降沿 stop。实测：启动 `provisioning page idle` 且 `curl :80` 失败；
+  `wifi ap on` 后 `/api/status` 返回 200；`wifi ap off` 后 `provisioning page stopped`
+  且端口恢复不通。
+- [~] 自动 fallback SoftAP 关闭：`panda_connectivity.c` 在 STA 拿到 IP 后 5s 关闭自动 AP
+  （`STA recovered, stopping fallback SoftAP`），并复位 `s_ap_user_off` 以便下次回退；
+  AP_STOP 300ms 防抖避免重新配置 AP 时配网页抖动。缺口：需路由器断网/重启才能实测。
+- [x] 字幕最多 2 行 + 超出滚动：固定 2 行窗口（340x56），`label` 高度超出时以 12px/s
+  自下而上循环滚动。实测 `ui subtitle` 长文本 → `label=324x100 box=340x56 scroll=1`，
+  短文本 → `label=324x20 box=340x56 scroll=0`。滚动动画需目视确认。
+- [x] 长回复容量：字幕缓冲 512B、回复缓冲 1024B，UTF-8 安全截断；实测 372 字节回复
+  完整显示 `subtitle 372B label=324x140`。
+- [~] WebSocket 锁饥饿：本地补丁 `esp_websocket_client.c` 的 recv 超时 5s→500ms
+  （与厂商 demo 本地补丁一致），避免 ws 任务持锁饿死上行。缺口：长回复中仍出现
+  `esp_transport_write() returned 0` 与 WS 重连失败，根因未定位。
+- [x] 已通过配网页 `POST /save` 恢复默认人格（CLI 受 linenoise UTF-8 过滤限制无法输入中文）。
+
+## 上一轮修复：STT 重复 / TTS 爆音 / 播放卡死（2026-11-10，已烧录待听感）
+
+> 对照 demo `Doubao_Ver1.1/components/doubao_voice/audio_out.c`；状态 `[~]`，等用户真人语音确认。
+
+1. **STT 字幕重复**
+   - 旧逻辑把每个 `input_audio_transcription.delta` 都 append，且 `completed` 后再追加整句，
+     服务器发累积文本时出现 `hellohellohello`。
+   - 现按 demo：delta 只记日志（前 12 条 LOGI），`completed` 一次性渲染最终文本；
+     `response.output_text.delta` 用 `merge_text()` 兼容增量/累积/重复。
+2. **爆音 / click**
+   - 新增 demo 多相重采样 `voice_resampler.c`（32 相×32 抽头，Kaiser β=8，Q15），
+     替换线性插值；跨 delta 保持相位/历史，消除采样不连续。
+   - 播放加入 50ms 启动淡入、10ms 续播淡入、10ms 停顿淡出、取消/打断 20ms 淡出后再清环；
+     `auto_clear` DMA 不再以阶跃声暴露。
+3. **整段卡住不播**
+   - 移除 codec 写 20×5ms 重试（一次写内部最长阻塞 1s，累计可达数秒）；
+     改为每轮一次写 + 170ms DMA 间隙检测，断流淡入。
+   - 预缓冲 200ms→500ms；ring<100ms 暂停、≥300ms 恢复；ring 静止 700ms 冲刷尾音，
+     避免“只剩尾包但不够预缓冲”永久等待。
+4. **触摸无法唤醒 / 无响应**
+   - 根因：CST816S 空闲约 0.5s 自动进入低功耗，I2C 地址仍 ACK，但坐标寄存器读取
+     全部 NACK/超时；旧逻辑 100 次失败后永久禁用触摸，于是无法唤醒也无法点击。
+   - 修复：初始化写 `0xFE=0x01` 关闭自动休眠；探测失败仍创建 indev，每 ~3s 复位重试；
+     保留日志静音防洪泛；新增 `touch diag` 现场读 ID/坐标寄存器。
+   - 实测：`touch diag` 三次读均 `ESP_OK`；长按屏幕触发 PTT 并识别 “hello”。
+5. **ASR 空最终转写**
+   - 本轮实际事件里 `completed.transcript` 为空（日志 `asr:` 空行），但 delta 有内容；
+     delta 仍只合并不渲染，`completed` 时若 transcript 为空则用合并结果兜底，保证字幕非空。
+
+## 上一轮修复（WiFi/字体/TTS，2026-11-09，代码完成待真机验证）
+
+1. **WiFi 掉线 / 网页配网**
+   - 关 Modem sleep（`WIFI_PS_NONE`）、指数退避+抖动重连、打印 `wifi:reason` 与原因提示、
+     全信道按信号扫描、PMF capable、国家码 CN。
+   - 有凭证但 20s 未拿到 IP 时自动开 SoftAP（`ap_auto` 标记），首页显示断线原因与 AP 状态；
+     配网页新增 `/api/scan`（`scanWifi()` 下拉选择）；只改密码也会触发重连。
+2. **中文乱码 / 字体**
+   - `ui_font_CJK16`（GB2312+ASCII+标点，16px 4bpp）作为四个 SquareLine 字体的 `.fallback`；
+     新增 `tools/fonts/check_coverage.py` 校验 UI 字符串用到的 269 个非 ASCII 字符全部有字形。
+3. **TTS 播放断续 / 丢包**
+   - 有状态 24k→16k 重采样（跨 delta 保持相位/插值尾样本）、200ms 预缓冲、欠载判定、
+     部分写入重试、TX/RX 独立锁、接受 WS 续帧（opcode 0x0）、RX 溢出按 `}` 重同步、
+     重连/取消时清 ring 与重采样状态、`voice stats` 暴露计数。
+   - 待真机验收：长回复连续播放、`underruns`/`ring_drops`/`decode_failures` 计数。
+4. **实体按键（KEY1–3）**
+   - KEY1 短按音量 −10%、KEY2 短按 +10%（NVS 保存、音频/UI 同步、toast）；
+     KEY3 短按循环设置菜单（快捷→人格→睡眠→系统→设备信息→时间天气），长按回主屏。
+   - `app_core_key_action()` 供按键轮询与 `key` CLI 共用；待真机确认三个按键的物理顺序。
+
+## 本轮新增：KEY3 菜单全功能（2026-11-09 晚，代码完成待真机）
+
+> 目标来自上一条 KEY3 审计。以下均为代码 + 编译/主机校验通过，**尚未接屏/触摸/喇叭**，
+> 状态标 `[~]`；2026-11-10 真机按文末清单验收。
+
+1. **快捷设置**
+   - Wi-Fi 开关接真实连接：开→用 NVS 凭证 `connect()`，无凭证→开配网 AP；
+     关→`panda_connectivity_ap(false)` + `disconnect()`（置手动断开，避免退避重连）。
+   - 勿扰（DND）改为扬声器静音：`panda_audio_mute()`，保留已存音量；状态落 NVS。
+   - 睡眠按钮进入真实 SLEEP 状态（语音播放中先 cancel），不再只切睡眠脸。
+   - 蓝牙 tile（`ui_bt_*`）隐藏：固件未链接 BT 协议栈，不做假开关。
+   - 亮度 tile 移到原蓝牙位置，系统设置页新增真实亮度滑块。
+2. **个性化**
+   - 性格/反馈强度/动画活跃度三组选项落 NVS（`pers/fb_lvl/anim_lvl`），互斥高亮随持久化状态恢复；
+     性格与反馈拼进 `session.create` 的 persona（下一轮对话生效）；动画活跃度映射
+     菜单切屏时长 0/150/250ms。
+3. **睡眠设置**
+   - 60s/300s/600s/关闭四档落 NVS；`app_core` 每秒检查，设备未睡、语音 IDLE/OFFLINE
+     且无触摸/按键/语音事件达到阈值后自动 `panda_ui_sleep()`。
+   - 睡眠动画开关、唤醒方式落 NVS；触摸/按键可唤醒并显示 1.2s 唤醒屏，
+     **语音唤醒未实现**（选“语音”时 toast 明示，触摸仍可用）。
+4. **系统设置 / 存储与版本**
+   - 亮度/音量改为真实 `lv_slider`（隐藏 SquareLine 静态 track/fill/knob，原位创建，
+     扩大点击区 18px）；拖动实时预览，松手写 NVS + toast。
+   - 两处百分比、Wi-Fi 文案、时间同步状态随周期刷新；SD 容量用
+     `esp_vfs_fat_info()` 读真实 total/free；版本号读 `esp_app_desc`（v2.0.0）。
+5. **时间天气**
+   - 新增 `app_weather.c`：Open-Meteo geocoding + forecast（无需新凭证），城市来自
+     NVS/配网页/`weather set`；成功 30min 刷新，失败 60s 重试，离线 10s 轮询。
+   - 温度与 3 类图标（晴/多云/阴）写入时间天气页；WMO 其余码归到“阴/雨/雪”等文字，
+     图标只有 3 种。响应缓冲 4KB 与任务栈均在 PSRAM，内部堆低于 28KB 时跳过本轮。
+6. **生效路径**
+   - 菜单回调 → `panda_ui_menu_hooks_t` → `app_core`：NVS 保存、音频/亮度/WiFi/休眠动作、
+     天气刷新；CLI/配网页改设置后调用 `app_core_settings_changed()` 立即同步 UI 与硬件。
+
+
+## 真机验证记录（2026-11-09）
+
+- 启动：ESP32-S3 v0.2，16MB Flash + 8MB PSRAM，USB-SERIAL-JTAG `/dev/ttyACM0`。
+- 通过：I2C0 扫描到 0x18/0x20/0x40/0x51；TCA9555 初始化无报错；RTC 读写并跨复位保持；SD 卡挂载（1876MB）；RGB 灯环设置/关闭；ES8311/ES7210 初始化；麦克风采集 rms=19..60。
+- 无屏容错：显示初始化成功、LVGL/37 屏创建成功；CST816S 探测 NACK 仅告警，系统继续启动并进入 CLI。
+- 未验证：屏幕显示、触摸手势、喇叭播放、电池电压（0R 未焊，见本轮电池 ADC 核查）、豆包云端。
+- 已修复：TCA9555 方向/电平顺序、亮度 NVS 应用、`rgb` 参数判断、`app_key` 默认值/明文打印、RTC 2000 年误判有效。
+
+### 2026-11-09 晚（建立交接流程时复验）
+
+- `idf.py build` 通过：0x70b1e0，剩余 30%。
+- 启动：ES8311/ES7210 正常，`audio ready (16kHz mono, mic=yes, volume=70%)`。
+- `heap`：internal≈46KB、PSRAM≈7.57MB、min_internal≈35KB。
+- `wifi status`：首次 STA 连接失败（`reason=2`）；`wifi ap on` 进入 APSTA 后 STA 成功连上
+  <家庭WiFi>，IP 192.168.x.x、RSSI -46dBm，并出现 `wifi: time synced: 2026-11-09 15:12:35`。
+- 配网：主机直连 `http://192.168.x.x/` 验证首页、`/api/status`、`POST /save`（音量 71 写入后恢复 70）、
+  captive portal 404→302；SoftAP `Panda-AI-00A1` 正常启动。
+- 语音：JSON 云端链路打通。`voice clip` → `commit acked` → `tts started` → 回复文本 →
+  `tts done deltas=12 ring=8269`，播完回到“待机”；连续两轮正常。
+- 打断：`voice cancel` 后 `tts done deltas=2 ring=0`（迟到音频被丢弃），下一轮可正常对话。
+- 状态机/UI：`make -C tools/ui_sim test` 46 checks/0 fail；`ui state listening/thinking/speaking/idle`、
+  `ui emotion happy`、`ui sleep`、`ui wake` 真机切屏正确，wake 1.2s 后回 idle。
+- 图片加载：主机 58/58 描述符校验 PASS；真机 `ui images` 37 屏/71 对象/58 唯一/0 失败。
+- 错误屏：`ui error asr/tts/network/auth` 分别切到 error_asr/error_tts/offline/error_llm，
+  `ui error clear` 回 idle。
+- 未验证：喇叭可听、麦克风真实语音 ASR、网页切换 WiFi、断网恢复、屏幕实际像素/触摸/帧率。
+
+### 2026-11-09 上轮（主机侧，无硬件）
+
+- `idf.py build` → 通过：`panda_ai.bin 0x7f7400`，剩余 `0x208c00 (20%)`。
+- `python3 tools/fonts/check_coverage.py` → PASS：字体 8371 字形，UI 字符串 269 个非 ASCII 字符全覆盖，
+  4 个 SquareLine 字体均已挂 `.fallback`。
+- `make -C tools/ui_sim test` → 46 checks, 0 failure(s)。
+- 未验证：以上三项修复均未接硬件；真机验收计划 2026-11-10（掉线恢复/RSSI、配网页扫码切换 WiFi、
+  TTS 连续播放与 `voice stats`、中文字幕/提示）。
+
+## M0 工程骨架与硬件自检
+
+- [x] 阅读 PRD、demo、原理图、屏幕/豆包官方文档
+- [x] 输出可行性/引脚冲突清单（docs/feasibility.md）
+- [x] ESP-IDF 工程骨架（CMake / partitions / sdkconfig / 组件，编译通过）
+- [~] panda_board：I2C0/TCA9555/RTC/SD/RGB 已实测；KEY1–3 已接音量/菜单动作，
+  物理按键顺序与实际触发待真机验证；电池待补焊 0R 后验证
+- [~] panda_display：ST77916 QSPI + LVGL9 + 背光；屏已接并正常显示，
+  实际像素/色彩/帧率与 37 屏逐屏观感待验收
+- [~] panda_touch：CST816S + 软件手势；自动休眠已关闭，长按 PTT/diag 实测通过；
+  单击/双击/滑动、休眠唤醒、误触待逐项验收
+- [~] 串口 CLI：status / ui / touch / brightness / volume / battery / time / settings / voice / audio / weather / rgb / i2c / sdcard / rtc / wifi / heap / reboot
+- [ ] 真机验证：启动日志、屏幕测试图案、触摸坐标、按键
+- [x] 记录构建/flash/monitor 命令和结果（README）
+
+## M1 语音闭环
+
+- [~] panda_audio：ES8311/ES7210、I2S 全双工；麦克风与喇叭均已接通，
+  `voice clip` 12/12 轮播放日志正常，爆音/卡死的听感待用户确认
+- [ ] 音频自检：tone、loopback、mic RMS、音量（`audio test` 仅有弱校验）
+- [~] panda_settings：NVS 配置（WiFi/豆包/音量/亮度/人格/反馈/动画/睡眠/勿扰/天气城市）
+  已接入；默认 `api_mode` 已改为 `json`（NVS 清空场景待复测）
+- [~] panda_connectivity：STA/AP/SNTP 已实测（192.168.x.x、-46dBm、时间同步）；
+  已加入 ps off/指数退避/全信道扫描/AP 自动回退，fallback AP 在 STA 恢复后 5s 自动关闭
+  （关闭分支待路由器断网实测）；配网页随 SoftAP 启停
+- [x] panda_voice（JSON）：测试音频→commit→ASR/TTS→回复文本已验证，两轮连续可用
+- [ ] panda_voice（O2.0）：官方二进制协议未实现，需控制台 app_id/access_key
+- [~] 触摸 PTT：长按已接 `app_voice`（BOOT 改为配网专用，不再触发 PTT）；
+  真人语音识别已验证，触摸时序仍需逐项验收
+- [~] 流式 TTS 播放 + 24k→16k：已按 demo 换成多相重采样 + 500ms 预缓冲 + 淡入淡出 +
+  暂停回滞 + 静音冲刷 + DMA 间隙检测；已烧录，待真机验听爆音/卡死与播放诊断日志
+- [x] 播放打断：`voice cancel` 已验证；取消后迟到音频丢弃（ring=0），下一轮正常
+- [~] 错误处理：WiFi 已指数退避；语音 WS 仍固定 5s 重连，鉴权错误（401/403）未分类停止
+- [~] 真机验证：连续两轮+打断已过；断网恢复、真实语音 ASR 未验证
+
+## M2 熊猫角色
+
+- [x] 接入 demo/ui SquareLine 37 屏资产（冲突符号去重、动画符号修复、编译通过）
+- [x] 设备/语音/情绪三维状态机 + 优先级/超时 + 顶部状态/字幕/toast overlay
+  （`panda_state.c`；主机仿真 46 项断言通过；真机 `ui screen` 切屏验证）
+- [x] 图片加载校验：58 个描述符主机逐项解析校验，真机 LVGL 解码器 37 屏/71 对象/0 失败
+- [~] 状态屏映射：Idle/Listening/Thinking/Speaking/Offline/Reconnecting/ASR/LLM/TTS/LowBattery/Sleep
+  （`ui screen` 映射已验证，屏已接；实际显示与状态/音频一致性待逐屏验收）
+- [~] 情绪屏映射：Happy/Surprise/Sad/Sleepy/Curious/Shy/Angry（已验证 happy；其余待真机逐项确认）
+- [x] 统一交互：生成 UI 负责导航，app_core 负责 PTT、双击电量、BOOT 键；设置页不被状态机抢占
+- [x] 浏览器全页面预览：20 个状态屏 + 12 个设备设置页 + 6 个未枚举表情页，按生成代码坐标/图片渲染
+  （`tools/ui_sim/web`；`gen_pages.py` 生成 `pages.js`；headless Firefox 逐页检查 18 个设置/表情页图片加载与 3 条页面链接跳转）
+- [~] 字幕（P1，可选开关）：ASR 最终转写与回复文本已上屏；已修掉 delta 重复叠加，
+  并限制为 2 行窗口、超长自下而上滚动；待真机目视滚动效果
+- [ ] SD 动画 manifest + 帧播放 + 缺卡兜底（P1）
+- [ ] 真机验证：状态与音频一致、实际像素/色彩/无明显掉帧
+- [ ] 真机验证：滑动手势、点击不误触发、亮度/音量入口
+
+## M3 产品化基础
+
+- [~] 配网网页（WiFi/豆包凭证/音色/音量/亮度/人格/天气城市）：首页/`/api/status`/
+  `POST /save`/captive portal 已端到端验证；新增 `/api/scan`、自动 AP 回退（20s）、
+  断线原因展示、密码变更重连、保存后立即应用并刷新天气。
+  网页服务已改为**按需开启**：仅在 SoftAP 生效（无凭证开机 / `wifi ap on` / 20s 回退）时
+  启动，热点关闭即停止；STA 恢复后自动回退热点在 5s 后关闭（防在途请求被截断）。
+  已实测 `wifi ap on` → `provisioning page enabled`、`wifi ap off` → `disabled`；
+  回退热点“恢复后自动关闭”仍需真实路由器断网复测
+- [~] 电量显示（硬件允许时）、低电降级（UI/周期任务已接入，ADC 阻塞）
+- [~] 时间显示、RTC 保持；SNTP 已验证 `time synced`；时间天气页已接真实天气，
+  屏幕时间显示与断电保持待补测
+- [~] 亮度/音量/静音：CLI + NVS + 快捷/系统设置 UI 已接线（真实滑块、DND=扬声器静音），
+      待真机触摸拖动与静音恢复验证
+- [~] 睡眠/唤醒：自动休眠（0/60/300/600s）、睡眠动画、触摸/按键唤醒已接；
+      深睡功耗策略与语音唤醒未实现
+- [~] 天气：Open-Meteo geocoding + forecast，城市可经 CLI/配网页设置；
+  真机 TLS 取数已验证（`weather refresh` → Beijing 11°C 晴）；图标仅 3 类，
+  30min 刷新与断网重试的长时间行为待观察
+- [ ] 隐私：未对话不上传、录音状态可见、日志不存原始音频
+- [~] 诊断页/CLI 统计（CLI status/heap 已完成；status 增加天气与菜单状态行）
+- [ ] 真机验证：断网本地功能、低电、睡眠唤醒、菜单全功能
+
+## M4 结构与可靠性
+
+- [ ] 整机装配/佩戴舒适度（硬件团队）
+- [ ] 声学/回声/风噪测试
+- [ ] WiFi 天线净空/衰减
+- [ ] 温升/续航/充电测试
+- [ ] 24h 稳定性、内存泄漏、100 轮对话
+
+## KEY3 菜单功能审计（2026-11-09）
+
+KEY3 循环的 6 个页面均已在 `ui_init()` 创建、导航与手势可用，但功能接线不完整：
+
+| 页面 | 已可用 | 缺口 |
+|---|---|---|
+| 快捷设置 | 音量文字随 KEY1/2/CLI 更新；Wi-Fi 状态灯/文字只读刷新 | Wi-Fi 开关只切图层，不连接/断开；蓝牙、勿扰无后端；亮度入口无控件；睡眠按钮只切睡眠脸，不进 SLEEP 状态 |
+| 个性化 | 三组选项互斥高亮 | 选择不落盘、不改变 `settings.persona`；反馈强度/动画活跃度无设置字段 |
+| 睡眠设置 | 选项互斥高亮 | `idle_timeout_s` 已有但未消费；无自动休眠定时器；唤醒方式/睡眠动画无字段 |
+| 系统设置 | 可跳转“存储与版本” | 亮度/音量滑块只是静态图层，无事件；两处百分比、网络、时间同步文案从不刷新 |
+| 存储与版本 | 跳转角色预览/表情/动画可用 | SD 容量与版本号为写死文案；未读 SD 卡与 `esp_app_desc` |
+| 时间天气 | 时钟/日期每秒随 RTC/SNTP 更新 | 天气图标/26°C 为写死占位，无数据源 |
+
+接线结果（2026-11-09 晚，详见上一节）：
+
+| 页面 | 状态 | 实现 / 仍需验证 |
+|---|---|---|
+| 快捷设置 | `[~]` | Wi-Fi 开关、勿扰静音、睡眠按钮、蓝牙隐藏、亮度入口已接；待真机触摸/视觉 |
+| 个性化 | `[~]` | 三组选项落 NVS、persona 组合、动画时长已接；待真机确认高亮与对话变化 |
+| 睡眠设置 | `[~]` | 自动休眠/唤醒方式/睡眠动画已接；语音唤醒未实现；待真机验证唤醒输入 |
+| 系统设置 | `[~]` | 真实滑块、百分比/Wi-Fi/时间同步动态刷新；待真机拖动与布局确认 |
+| 存储与版本 | `[~]` | SD 容量、固件版本改为真实读取；待真机核对数值 |
+| 时间天气 | `[~]` | Open-Meteo 数据、城市可配；待真机联网取数与中文显示 |
+
+- [~] 菜单功能接线（P1）：音量/亮度滑块、个性化落盘、睡眠定时、系统信息动态化
+      已实现并编译通过；缺口是无屏/触摸，滑块手感、布局遮挡与实际显示未验证。
+- [~] 快捷设置降级处理（P2）：蓝牙 tile 隐藏，勿扰=扬声器静音，Wi-Fi 开关接真实连接；
+      缺口是真机确认 Wi-Fi 关→开（含 AP 回退）与静音恢复。
+- [~] 天气数据源（P2）：采用 Open-Meteo（geocoding + forecast，无需凭证）；
+      缺口是真机 TLS 取数、30min 刷新与断网重试，另外图标只有晴/多云/阴 3 种。
+
+## 2026-11-10 真机验收清单（本轮菜单功能）
+
+- [ ] 系统设置：拖亮度/音量滑块，标签实时变化，松手后重启仍保持；滑块无遮挡。
+- [ ] 快捷设置：Wi-Fi 关→状态灯灭/文案“未连接”→开→重新连上（无凭证时开 AP）；
+      勿扰开→TTS 静音，关→恢复原音量；睡眠按钮进入睡眠屏；蓝牙 tile 不出现。
+- [ ] 个性化：三组选项重启后保持高亮；换性格后下一轮 `voice clip` 的回复风格变化。
+- [ ] 睡眠设置：60s 档静置自动入睡；触摸/KEY 唤醒并显示 1.2s 唤醒屏；
+      选“语音唤醒”出现“暂不支持”提示；睡眠动画开关有可见差异。
+- [ ] 存储与版本：SD 容量与主机 `df` 一致；版本显示 `v2.0.0`。
+- [ ] 时间天气：联网后显示真实温度/图标；`weather set 上海` 后刷新；断网不崩溃。
+- [ ] 串口辅助：`status` 的 weather/menu 行、`settings show`、`weather`、`key 1|2|3`。
+
+## 阻塞项
+
+- [!] 豆包 O2.0 控制台权限/模型版本未确认：仅 JSON 链路可联调，生产协议无法落地。
+- [!] 电池 ADC 需补焊 R53(1-3)+R78(1-2) 两个 0R：GPIO1 目前悬空，电压/电量
+  无法读数（固件已就绪并会自动识别）。补焊后摄像头 HREF 不可用。
+- [!] WiFi “假在线”卡死未根除：已有自动恢复阶梯（67s 故障→95.5s 触发→99.5s 恢复），
+  恢复期间在途回复会丢失，故障仍偶发；候选方向是对齐 demo 的射频缓冲参数。

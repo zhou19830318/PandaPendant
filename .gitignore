@@ -1,0 +1,42 @@
+# Vendor/reference code is not part of the product repo
+demo/
+
+# ESP-IDF build output
+build/
+panda_ai/build/
+demo/**/build/
+
+# Component manager
+managed_components/
+panda_ai/managed_components/
+demo/**/managed_components/
+
+# Local configuration / secrets
+doubao_api_key.txt
+sdkconfig
+sdkconfig.old
+panda_ai/sdkconfig
+panda_ai/sdkconfig.old
+demo/**/sdkconfig
+demo/**/sdkconfig.old
+secrets.h
+**/secrets.h
+*.pem
+*.key
+*.crt
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs / temporary files
+*.log
+*.tmp
+__pycache__/
+*.pyc
+.pytest_cache/
+tools/ui_sim/ui_sim

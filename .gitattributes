@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.bin binary
+*.a binary
+*.o binary
+*.elf binary
+*.zip binary
+
+panda_ai/components/panda_ui/generated/** linguist-generated=true

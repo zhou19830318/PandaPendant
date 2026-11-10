@@ -1,0 +1,73 @@
+#pragma once
+
+#include "driver/gpio.h"
+
+/* Waveshare ESP32-S3-AUDIO-Board + Waveshare 1.85 inch QSPI LCD */
+#define PANDA_BOARD_NAME "Waveshare ESP32-S3 Audio + 1.85\" LCD"
+
+/* I2C0: TCA9555 / ES8311 / ES7210 / PCF85063 / CST816S */
+#define PANDA_I2C_PORT 0
+#define PANDA_I2C_SCL GPIO_NUM_10
+#define PANDA_I2C_SDA GPIO_NUM_11
+#define PANDA_I2C_FREQ_HZ 400000
+
+/* TCA9555 */
+#define PANDA_IOEXP_ADDR 0x20
+#define PANDA_IOEXP_LCD_RST 0
+#define PANDA_IOEXP_TP_RST 1
+#define PANDA_IOEXP_TP_INT 2
+#define PANDA_IOEXP_SD_CS 3
+#define PANDA_IOEXP_CAM_EN 4
+#define PANDA_IOEXP_CAM_MUX 6
+#define PANDA_IOEXP_PA_EN 8
+#define PANDA_IOEXP_BTN1 9
+#define PANDA_IOEXP_BTN2 10
+#define PANDA_IOEXP_BTN3 11
+
+/* LCD QSPI */
+#define PANDA_LCD_HOST SPI2_HOST
+#define PANDA_LCD_SCLK GPIO_NUM_4
+#define PANDA_LCD_D0 GPIO_NUM_9
+#define PANDA_LCD_D1 GPIO_NUM_8
+#define PANDA_LCD_D2 GPIO_NUM_7
+#define PANDA_LCD_D3 GPIO_NUM_6
+#define PANDA_LCD_CS GPIO_NUM_3
+#define PANDA_LCD_BL GPIO_NUM_5
+#define PANDA_LCD_H_RES 360
+#define PANDA_LCD_V_RES 360
+#define PANDA_LCD_BPP 16
+#define PANDA_LCD_MAX_TRANSFER (PANDA_LCD_H_RES * 80 * sizeof(uint16_t))
+
+/* Touch */
+#define PANDA_TOUCH_ADDR 0x15
+#define PANDA_TOUCH_SCL PANDA_I2C_SCL
+#define PANDA_TOUCH_SDA PANDA_I2C_SDA
+
+/* Audio */
+#define PANDA_I2S_NUM 0
+#define PANDA_I2S_MCLK GPIO_NUM_12
+#define PANDA_I2S_SCLK GPIO_NUM_13
+#define PANDA_I2S_LRCK GPIO_NUM_14
+#define PANDA_I2S_DIN GPIO_NUM_15
+#define PANDA_I2S_DOUT GPIO_NUM_16
+#define PANDA_AUDIO_RATE 16000
+#define PANDA_AUDIO_BITS 16
+#define PANDA_ES8311_ADDR 0x18
+#define PANDA_ES7210_ADDR 0x40
+
+/* SD card (SDMMC 1-bit) */
+#define PANDA_SD_CLK GPIO_NUM_40
+#define PANDA_SD_CMD GPIO_NUM_42
+#define PANDA_SD_D0 GPIO_NUM_41
+#define PANDA_SD_MOUNT_POINT "/sdcard"
+
+/* RTC */
+#define PANDA_RTC_ADDR 0x51
+
+/* Buttons / LED */
+#define PANDA_BOOT_BUTTON GPIO_NUM_0
+#define PANDA_RGB_GPIO GPIO_NUM_38
+#define PANDA_RGB_LEDS 7
+
+/* Battery ADC (optional hardware rework, conflicts with camera HREF) */
+#define PANDA_BAT_ADC_GPIO GPIO_NUM_1
