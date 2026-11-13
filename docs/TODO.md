@@ -19,8 +19,8 @@
   （0x1d0cb0）；`project(panda_ai VERSION 2.0.0)`；已烧录 `/dev/ttyACM0`。
 - 新增 `CONFIG_LV_FONT_MONTSERRAT_48=y`（`sdkconfig.defaults`）供音乐页 48px 图标，
   bin 因此增加约 96KB。
-- 配网页改为按需运行：仅 SoftAP 开启时启动，SoftAP 关闭即停止；有凭证正常启动时
-  日志为 `provisioning page idle (use 'wifi ap on' when needed)`。
+- 配网页按需运行：SoftAP 或 STA 任一联网时启动，网络全断时停止；STA 在线可直接
+  访问 `http://<设备IP>/`，也可 `wifi ap on` 后访问 `192.168.4.1`。
 - 串口 CLI 已接入：status/ui/touch/brightness/volume/battery/time/settings/voice/audio/weather/rgb/i2c/sdcard/rtc/wifi/heap/reboot；
   `ui error asr|llm|tts|audio|network|auth|generic|clear` 可注入/清除错误屏；
   `ui images` 可无屏检查 37 屏的图片解码（37 屏/71 对象/58 唯一/0 失败）；
