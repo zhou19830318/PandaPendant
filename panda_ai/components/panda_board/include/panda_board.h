@@ -63,9 +63,12 @@ uint32_t panda_board_battery_mv(void);
 int panda_board_battery_percent(void);
 bool panda_board_battery_charging(void);
 
-/* RGB ring (7x WS2812), brightness 0-100 internal scale */
+/* RGB ring (7x WS2812). rgb_write takes count*3 bytes (RGB order) and does a
+ * single strip refresh so a whole frame costs one RMT transfer. */
 esp_err_t panda_board_rgb_init(void);
+bool panda_board_rgb_ready(void);
 esp_err_t panda_board_rgb_set(uint8_t r, uint8_t g, uint8_t b);
+esp_err_t panda_board_rgb_write(const uint8_t *rgb, int count);
 esp_err_t panda_board_rgb_off(void);
 
 /* Diagnostics */

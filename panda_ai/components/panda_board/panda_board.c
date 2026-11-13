@@ -559,13 +559,35 @@ esp_err_t panda_board_rgb_init(void)
     return ESP_OK;
 }
 
+bool panda_board_rgb_ready(void)
+{
+    return s_rgb != NULL;
+}
+
 esp_err_t panda_board_rgb_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    uint8_t frame[PANDA_RGB_LEDS * 3];
+    for (int i = 0; i < PANDA_RGB_LEDS; i++) {
+        frame[i * 3 + 0] = r;
+        frame[i * 3 + 1] = g;
+        frame[i * 3 + 2] = b;
+    }
+    return panda_board_rgb_write(frame, PANDA_RGB_LEDS);
+}
+
+esp_err_t panda_board_rgb_write(const uint8_t *rgb, int count)
 {
     if (!s_rgb) {
         return ESP_ERR_INVALID_STATE;
     }
-    for (int i = 0; i < PANDA_RGB_LEDS; i++) {
-        led_strip_set_pixel(s_rgb, i, r, g, b);
+    if (rgb == NULL || count <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (count > PANDA_RGB_LEDS) {
+        count = PANDA_RGB_LEDS;
+    }
+    for (int i = 0; i < count; i++) {
+        led_strip_set_pixel(s_rgb, i, rgb[i * 3 + 0], rgb[i * 3 + 1], rgb[i * 3 + 2]);
     }
     return led_strip_refresh(s_rgb);
 }

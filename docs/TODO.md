@@ -15,8 +15,8 @@
 
 ## 当前构建状态（2026-11-13）
 
-- `idf.py build` 通过：`panda_ai.bin` 0x82db70（约 8.20MB），factory 10MB 剩余 18%
-  （0x1d2490）；`project(panda_ai VERSION 2.0.0)`；已烧录 `/dev/ttyACM0`。
+- `idf.py build` 通过：`panda_ai.bin` 0x82f350（约 8.20MB），factory 10MB 剩余 18%
+  （0x1d0cb0）；`project(panda_ai VERSION 2.0.0)`；已烧录 `/dev/ttyACM0`。
 - 新增 `CONFIG_LV_FONT_MONTSERRAT_48=y`（`sdkconfig.defaults`）供音乐页 48px 图标，
   bin 因此增加约 96KB。
 - 配网页改为按需运行：仅 SoftAP 开启时启动，SoftAP 关闭即停止；有凭证正常启动时
@@ -29,6 +29,35 @@
   `audio tone [seconds]` 连续 880Hz 音；`voice pump on|off` 开关上行静音泵（诊断用）；
   `mp3 status|list|play [index]|toggle|next|prev|stop`，`mp3 status` 额外输出
   `audio_rate/underruns/buffered/flags`（flags：bit0 primed、bit1 eof、bit2 idle、bit3 abort）。
+
+## 本轮：RGB 灯环状态联动（2026-11-13，真机串口验证）
+
+- [x] `panda_board`：新增 `panda_board_rgb_ready()` 与 `panda_board_rgb_write(rgb, count)`，
+  整帧 21 字节一次 RMT 刷新；`rgb_set` 复用该接口。
+- [x] `panda_audio`：新增 `panda_audio_get_output_level()`（写入块峰值 0..100），
+  最近 250ms 无写入即返回 0，暂停/停止后 VU 正常衰减；切采样率重开 codec 后
+  重新应用静音状态。
+- [x] 新增 `panda_led` 组件（core0、prio 2、栈 3KB）：待机/配网/离线/聆听/思考/
+  说话/错误/低电/充电/MP3 播放与暂停各自动画；音量左/右闪、唤醒爆闪、联网扫光。
+  VU 经 sqrt 感知曲线（音乐峰值普遍偏低），中点亮起并向外扩散。
+- [x] 节能：亮度 gamma 2.0、总功率预算 1100（21 通道字节和）、帧不变跳过刷新、
+  周期 40/120/300/1000ms（播放与语音/待机/手动/睡眠），睡眠与关闭时全灭。
+  默认 `full` 模式、亮度 45%。
+- [x] `app_core` 接线：语音状态、MP3 播放/暂停/曲号、WiFi 连接/AP、电池、
+  睡眠/唤醒、音量键；`serial_cli` 扩展
+  `rgb status|mode|brightness|<r> <g> <b>|off`，`ui sleep|wake` 同步灯环状态。
+- [x] 构建：`idf.py build` → 0x82f350，factory 剩余 18%（0x1d0cb0）；已烧录。
+- [x] 真机串口验证：
+  - 播放：`rgb mode=full brightness=45% level=6 refresh=41` → 2s 后
+    `level=2 refresh=80`（39 次刷新/2s，VU 随音乐起伏）。
+  - 暂停：`mp3 toggle` 后 1.2s `level=0`，随后 2s 仅 5 次刷新（待机周期）。
+  - 音量键：`key 1/2` 日志 `volume=70%/80% (audio 0–4 ms)`，灯环照常刷新。
+  - 睡眠：`ui sleep` 后 3s `refresh` 增量 0、`level=0`（灯灭且停止 RMT）。
+  - 唤醒：`ui wake` 后 2s `refresh` +20（呼吸恢复）。
+  - 堆：`free=7179452 internal=84071 psram=7140696`，无复位/断言。
+- [~] 用户目视验收：默认亮度 45% 下各状态颜色、亮度、VU 居中扩散观感。
+  缺口：需人眼确认；补验：正常开机看薄荷绿呼吸 → 播放 MP3 看彩色 VU →
+  按音量键看左右闪 → `ui sleep`/按键唤醒看熄灭与白闪。
 
 ## 本轮：播放中音量键 + 音乐页图标（2026-11-13 真机验证）
 

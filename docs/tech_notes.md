@@ -789,3 +789,30 @@ TCA9555 的输出锁存器复位值为 `0xFF`。初始化必须先 `set_dir(out_
   把覆盖项存到临时文件，再用
   `idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/local.defaults" reconfigure`
   重建，并 diff 确认只多目标一行。
+
+## 19. RGB 灯环联动：亮度 gamma、VU 曲线与节能观测（2026-11-13 真机）
+
+### gamma 会吃掉低幅动画
+- `output_frame()` 先乘亮度再平方（`v*v/255`，gamma≈2）。默认亮度 45% 时，
+  原呼吸幅度 `0.05–0.16` 的通道值经 gamma 后长期为 0：灯环看似全灭，
+  `rgb status` 的 `refresh` 计数也长时间不涨（帧相同被跳过）。
+- 规则：按“目标字节”反推幅度。要得到约 5–10 的通道字节，pre-gamma 值约
+  `sqrt(byte*255)≈36–50`，即 45% 亮度下幅度约 0.3 起。现网待机/AP/充电/
+  低电呼吸均已提到 0.22–0.65；VU 最低幅度 0.45。
+
+### 音乐峰值远低于满刻度
+- 实测多首 320kbps MP3，`panda_audio` 每块峰值换算 level 仅 2–19（-34…-14 dBFS）。
+  线性映射到 7 颗灯几乎只亮 1 颗；`vu()` 里做 `sqrt(level/100)*100` 感知映射后，
+  level 16 → 40 → 亮 3 颗，低音量段也有层次。
+- `panda_audio_get_output_level()` 必须带 250ms 过期：暂停/停止后不再写 PCM，
+  否则返回最后一块峰值，VU 会“冻结”在暂停瞬间（实测曾停在 5）。
+
+### 节能与可观测性
+- 刷新周期：播放或语音 40ms、待机 120ms、手动常亮 300ms、睡眠/关闭 1000ms；
+  帧与上一帧相同则跳过 `led_strip_refresh()`。
+- `rgb status` 的 `refresh` 是现成功耗探针：播放约 39 次/2s、待机约 10 次/2s、
+  `ui sleep` 后 3s 增量为 0（全灭 + 停止 RMT）；`ui wake` 后恢复约 10 次/2s。
+- `panda_led` 组件用到 `esp_timer_get_time()`，CMake 需
+  `PRIV_REQUIRES esp_timer`（`panda_audio` 新增电平时间戳同理）。
+- 串口 `ui sleep|wake` 只调 UI 会与灯环状态脱节；两处都要同步
+  `panda_led_set_sleeping()`，唤醒再加 `panda_led_notify_wake()`。

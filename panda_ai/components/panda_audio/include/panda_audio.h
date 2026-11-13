@@ -25,6 +25,9 @@ uint32_t panda_audio_get_rate(void);
 esp_err_t panda_audio_set_volume(int percent);
 esp_err_t panda_audio_get_volume(int *percent);
 esp_err_t panda_audio_mute(bool mute);
+/* Peak of the last written PCM block, 0..100 (pre-volume, 0 while muted).
+ * Updated by every panda_audio_play() call, so TTS and MP3 share it. */
+int panda_audio_get_output_level(void);
 /* Raw ES8311 register read (diagnostics: 0x31 mute, 0x32 DAC volume). */
 esp_err_t panda_audio_get_codec_reg(uint8_t reg, int *value);
 esp_err_t panda_audio_self_test(void);

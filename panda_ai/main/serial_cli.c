@@ -30,6 +30,7 @@
 #include "app_provisioning.h"
 #include "panda_display.h"
 #include "panda_touch.h"
+#include "panda_led.h"
 #include "panda_mp3.h"
 #include "panda_ui.h"
 
@@ -161,10 +162,13 @@ static int cmd_ui(int argc, char **argv)
     }
     if (!strcmp(argv[1], "sleep")) {
         panda_ui_sleep();
+        panda_led_set_sleeping(true);
         return 0;
     }
     if (!strcmp(argv[1], "wake")) {
         panda_ui_wake();
+        panda_led_set_sleeping(false);
+        panda_led_notify_wake();
         return 0;
     }
 
@@ -726,10 +730,52 @@ static int cmd_audio(int argc, char **argv)
 
 static int cmd_rgb(int argc, char **argv)
 {
-    if (argc >= 2 && !strcmp(argv[1], "off")) {
-        esp_err_t err = panda_board_rgb_off();
-        printf("rgb off: %s\n", esp_err_to_name(err));
-        return err == ESP_OK ? 0 : 1;
+    if (argc < 2) {
+        printf("usage: rgb status | rgb mode off|state|audio|full|manual | "
+               "rgb brightness [0..100] | rgb <r> <g> <b> | rgb off\n");
+        return 1;
+    }
+    if (!strcmp(argv[1], "off")) {
+        panda_led_set_mode(PANDA_LED_MODE_OFF);
+        printf("rgb mode off\n");
+        return 0;
+    }
+    if (!strcmp(argv[1], "status")) {
+        printf("rgb mode=%s brightness=%d%% level=%d refresh=%" PRIu32 "\n",
+               panda_led_mode_name(panda_led_get_mode()),
+               panda_led_get_brightness(), panda_audio_get_output_level(),
+               panda_led_refresh_count());
+        return 0;
+    }
+    if (!strcmp(argv[1], "mode")) {
+        if (argc < 3) {
+            printf("usage: rgb mode off|state|audio|full|manual\n");
+            return 1;
+        }
+        static const char *names[] = {"off", "state", "audio", "full", "manual"};
+        for (int i = 0; i <= PANDA_LED_MODE_MANUAL; i++) {
+            if (!strcmp(argv[2], names[i])) {
+                panda_led_set_mode((panda_led_mode_t)i);
+                printf("rgb mode %s\n", names[i]);
+                return 0;
+            }
+        }
+        printf("unknown mode '%s'\n", argv[2]);
+        return 1;
+    }
+    if (!strcmp(argv[1], "brightness")) {
+        int pct;
+        if (argc < 3) {
+            printf("rgb brightness=%d%%\n", panda_led_get_brightness());
+            return 0;
+        }
+        if (parse_int(argv[2], 0, 100, &pct)) {
+            printf("brightness must be 0..100\n");
+            return 1;
+        }
+        panda_led_set_brightness(pct);
+        printf("rgb brightness=%d%%\n", panda_led_get_brightness());
+        return 0;
     }
     if (argc >= 4) {
         int r, g, b;
@@ -738,11 +784,12 @@ static int cmd_rgb(int argc, char **argv)
             printf("rgb values must be 0..255\n");
             return 1;
         }
-        esp_err_t err = panda_board_rgb_set((uint8_t)r, (uint8_t)g, (uint8_t)b);
-        printf("rgb set: %s\n", esp_err_to_name(err));
-        return err == ESP_OK ? 0 : 1;
+        panda_led_set_manual((uint8_t)r, (uint8_t)g, (uint8_t)b);
+        printf("rgb manual %d %d %d\n", r, g, b);
+        return 0;
     }
-    printf("usage: rgb <r> <g> <b> | rgb off\n");
+    printf("usage: rgb status | rgb mode ... | rgb brightness [0..100] | "
+           "rgb <r> <g> <b> | rgb off\n");
     return 1;
 }
 
@@ -1012,7 +1059,7 @@ static const esp_console_cmd_t s_commands[] = {
     {.command = "voice", .help = "Voice pipeline test: start, active, ptt down/up, clip, pump on/off, cancel", .func = cmd_voice},
     {.command = "audio", .help = "Audio self-test: audio test", .func = cmd_audio},
     {.command = "wifi", .help = "WiFi: status|scan|connect <ssid> [pass]|disconnect|forget|ap on/off|sync|recover", .func = cmd_wifi},
-    {.command = "rgb", .help = "RGB LEDs: rgb <r> <g> <b> | rgb off", .func = cmd_rgb},
+    {.command = "rgb", .help = "RGB LEDs: rgb status|mode|brightness | rgb <r> <g> <b> | rgb off", .func = cmd_rgb},
     {.command = "i2c", .help = "Scan the board I2C bus", .func = cmd_i2c},
     {.command = "sdcard", .help = "SD card: status|ls [path]|mount|unmount", .func = cmd_sdcard},
     {.command = "rtc", .help = "Read RTC or write: rtc write <epoch>", .func = cmd_rtc},

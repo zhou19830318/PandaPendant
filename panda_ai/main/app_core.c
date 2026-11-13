@@ -5,6 +5,7 @@
 #include "panda_board.h"
 #include "panda_connectivity.h"
 #include "panda_display.h"
+#include "panda_led.h"
 #include "panda_mp3.h"
 #include "panda_ui.h"
 
@@ -98,6 +99,8 @@ static bool wake_if_sleeping(void)
         return false;
     }
     panda_ui_wake();
+    panda_led_set_sleeping(false);
+    panda_led_notify_wake();
     touch_activity();
     ESP_LOGI(TAG, "wake by input");
     return true;
@@ -165,6 +168,7 @@ static void volume_step(int delta)
     int64_t t2 = esp_timer_get_time();
     s_vol_dirty = true;
     s_vol_dirty_us = t2;
+    panda_led_notify_volume(delta > 0 ? 1 : -1, pct);
     ESP_LOGI(TAG, "key volume=%d%% (audio %lld ms %s, ui %lld ms)", pct,
              (long long)((t1 - t0) / 1000), esp_err_to_name(aerr),
              (long long)((t2 - t1) / 1000));
@@ -228,6 +232,7 @@ static void menu_sleep_now_hook(void)
         app_voice_cancel();
     }
     panda_ui_sleep();
+    panda_led_set_sleeping(true);
     ESP_LOGI(TAG, "sleep requested from menu");
 }
 
@@ -334,6 +339,13 @@ static void music_page_sync(void)
     if (on) {
         music_page_refresh();
     }
+    panda_led_play_t play = PANDA_LED_PLAY_IDLE;
+    switch (panda_mp3_state()) {
+    case PANDA_MP3_PLAYING: play = PANDA_LED_PLAY_PLAYING; break;
+    case PANDA_MP3_PAUSED: play = PANDA_LED_PLAY_PAUSED; break;
+    default: break;
+    }
+    panda_led_set_play(play, panda_mp3_current());
 }
 
 static void provisioning_qr_sync(void)
@@ -617,6 +629,10 @@ static void app_core_task(void *arg)
                 s_wifi_ap = ev.u.wifi.ap;
                 s_wifi_connecting = ev.u.wifi.connecting;
                 panda_ui_set_wifi(s_wifi_connected, s_wifi_ap, s_wifi_connecting);
+                panda_led_set_network(s_wifi_connected, s_wifi_ap);
+                if (!was_connected && s_wifi_connected) {
+                    panda_led_notify_network_connected();
+                }
 #if CONFIG_PANDA_PROVISIONING
                 if (s_wifi_ap != was_ap) {
                     if (s_wifi_ap) {
@@ -710,6 +726,7 @@ static void app_core_task(void *arg)
             if (cfg->auto_sleep_s > 0 && !panda_ui_is_sleeping() && voice_idle &&
                 (now - s_last_active_us) >= (int64_t)cfg->auto_sleep_s * 1000000) {
                 panda_ui_sleep();
+                panda_led_set_sleeping(true);
                 ESP_LOGI(TAG, "auto sleep after %ds idle", cfg->auto_sleep_s);
             }
 
@@ -751,6 +768,7 @@ static void app_core_task(void *arg)
             bool charging = panda_board_battery_charging();
             ESP_LOGD(TAG, "battery present=%d mv=%" PRIu32 " pct=%d chg=%d", present, mv, pct, charging);
             panda_ui_set_battery(pct, charging, present);
+            panda_led_set_battery(pct, charging, present);
             if (present && pct >= 0 && pct <= 10 && !s_low_batt_warned) {
                 s_low_batt_warned = true;
                 panda_ui_set_device_state(PANDA_DEVICE_LOW_BATTERY);
@@ -811,6 +829,7 @@ esp_err_t app_core_start(void)
     panda_ui_set_music_hooks(music_prev_hook, music_toggle_hook,
                              music_next_hook, music_exit_hook);
     panda_mp3_init();
+    panda_led_init();
     BaseType_t ok = xTaskCreatePinnedToCore(app_core_task, "app_core", 6 * 1024, NULL, 5, NULL, 1);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
@@ -852,6 +871,7 @@ void app_core_set_time_from_epoch(time_t epoch)
 void app_core_on_voice_state(panda_voice_ui_t state)
 {
     touch_activity();
+    panda_led_set_voice((panda_led_voice_t)state);
     /* Status text, screen and overlays are derived by panda_state so every
      * input path (voice, touch, CLI, network) goes through one state machine. */
     if (!s_ui_pending_lock) {

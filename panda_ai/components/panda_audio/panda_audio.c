@@ -6,6 +6,7 @@
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -39,6 +40,9 @@ static SemaphoreHandle_t s_rx_lock;
 static SemaphoreHandle_t s_ctl_lock;
 #define CTL_LOCK_TIMEOUT_MS 200
 static int s_volume = DEFAULT_VOLUME;
+static volatile int s_out_level;
+static volatile int64_t s_out_level_us;
+static bool s_muted;
 static bool s_ready;
 static bool s_has_mic;
 static uint32_t s_rate = PANDA_AUDIO_RATE;
@@ -187,6 +191,8 @@ static esp_err_t codecs_open(void)
         return ESP_FAIL;
     }
     esp_codec_dev_set_out_vol(s_out, s_volume);
+    /* Re-opening the codec drops the mute register, so re-apply it. */
+    esp_codec_dev_set_out_mute(s_out, s_muted);
     panda_board_pa_enable(true);
 
     if (s_in != NULL) {
@@ -375,6 +381,19 @@ esp_err_t panda_audio_play(const int16_t *buffer, size_t samples, size_t *sample
     if (ret != 0) {
         return ESP_FAIL;
     }
+    /* Cheap peak pass for the LED VU; 1024 samples per ~21 ms is negligible. */
+    int peak = 0;
+    for (size_t i = 0; i < samples; i++) {
+        int a = buffer[i];
+        if (a < 0) {
+            a = -a;
+        }
+        if (a > peak) {
+            peak = a;
+        }
+    }
+    s_out_level = (peak * 100) / 32768;
+    s_out_level_us = esp_timer_get_time();
     if (samples_written) {
         *samples_written = samples;
     }
@@ -425,8 +444,24 @@ esp_err_t panda_audio_mute(bool mute)
         return ESP_ERR_TIMEOUT;
     }
     int ret = esp_codec_dev_set_out_mute(s_out, mute);
+    if (ret == 0) {
+        s_muted = mute;
+    }
     xSemaphoreGive(s_ctl_lock);
     return ret == 0 ? ESP_OK : ESP_FAIL;
+}
+
+int panda_audio_get_output_level(void)
+{
+    if (s_muted || s_volume == 0) {
+        return 0;
+    }
+    /* Pause/stop leaves the last block's peak behind; expire it so the VU
+     * decays to silence instead of freezing at the last value. */
+    if (esp_timer_get_time() - s_out_level_us > 250000) {
+        return 0;
+    }
+    return s_out_level;
 }
 
 esp_err_t panda_audio_get_codec_reg(uint8_t reg, int *value)

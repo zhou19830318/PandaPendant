@@ -51,8 +51,8 @@ cd panda_ai
 idf.py build
 ```
 
-当前产物约 8.20MB（`0x82db70`，固件版本 2.0.0），factory 分区剩余 18%
-（`0x1d2490`）。其中约 96KB 来自音乐页图标所需的 48px Montserrat 字体
+当前产物约 8.20MB（`0x82f350`，固件版本 2.0.0），factory 分区剩余 18%
+（`0x1d0cb0`）。其中约 96KB 来自音乐页图标所需的 48px Montserrat 字体
 （`CONFIG_LV_FONT_MONTSERRAT_48=y`，固定在 `sdkconfig.defaults`）。
 
 主机侧自检（不需要设备）：
@@ -120,7 +120,9 @@ wifi [status|scan|connect <ssid> [pass]|disconnect|forget|ap on|off|sync|recover
 # voice stats 输出 TTS 计数：deltas/ring_drops/underruns/write_retries/rx_overflows
 # voice pump off 关闭对话间 50ms 静音上行（诊断用；关闭后服务端会因无音频输入关会话）
 audio test | audio status | audio tone [seconds]   # tone 连续 880Hz（诊断用）
-rgb <r> <g> <b> | rgb off
+rgb status | rgb mode off|state|audio|full|manual | rgb brightness [0..100]
+rgb <r> <g> <b> | rgb off            # 手动常亮单色 / 关闭灯环
+# rgb status 输出 mode/brightness/level/refresh；level 为最近 250ms 的输出峰值 0..100
 i2c | sdcard status|ls [path]|mount|unmount | rtc [write <epoch>]
 mp3 status|list|play [index]|toggle|next|prev|stop   # SD 卡 Music 目录播放
 # mp3 status 额外输出 audio_rate/underruns/buffered/flags；稳定播放应 underruns=0、
@@ -145,6 +147,26 @@ heap | reboot
 
 KEY1–3 经 TCA9555 轮询（20ms），只有 BOOT 能作为深睡唤醒源。
 菜单页与触摸手势共用同一批生成页面；语音/错误/低电等紧急状态仍会抢占菜单。
+
+## RGB 灯环
+
+7 颗 WS2812（GPIO38）默认 `full` 模式、亮度 45%，按设备状态自动变化：
+
+| 状态 | 效果 |
+|---|---|
+| 待机（联网） | 薄荷绿缓慢呼吸 |
+| 配网热点 / 连接中 | AP 蓝色呼吸；STA 连接中琥珀色跑马灯 |
+| 未联网 / 离线 | 琥珀色呼吸；离线为 1.6s 周期闪烁 |
+| 聆听 / 思考 / 说话 | 青色行波；紫色跑马灯；暖白音量柱（TTS 与 MP3 共用） |
+| MP3 播放 / 暂停 | 每首不同色相的音量柱（随电平起伏）/ 暗琥珀呼吸 |
+| 错误 | 红色双闪 |
+| 低电 / 充电 | 红色呼吸 / 绿色按电量填充 |
+| 音量键 | 左/右三颗绿色短闪（按住重复） |
+| 唤醒 / 联网成功 | 白色爆闪 / 绿色扫过一圈 |
+
+节能处理：亮度经 gamma 2.0 与总功率预算（21 通道字节和 ≤1100）限制；帧内容
+不变时跳过 RMT 刷新；任务周期按状态在 40ms（播放/语音）、120ms（待机）、
+300ms（手动常亮）、1000ms（睡眠/关闭）之间切换；睡眠与关闭时灯环全灭且停止刷新。
 
 ## 菜单功能
 
