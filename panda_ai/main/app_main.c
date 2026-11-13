@@ -66,12 +66,22 @@ void app_main(void)
         ESP_LOGE(TAG, "display unavailable, UI disabled: %s", esp_err_to_name(err));
     }
 
+    /* Start the console before app_core: the voice websocket task (8 KB) and
+     * its three audio tasks fragment the internal heap enough that the 6 KB
+     * REPL task can no longer be allocated afterwards. */
+#if CONFIG_PANDA_SERIAL_CLI
+    err = serial_cli_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "serial CLI unavailable: %s", esp_err_to_name(err));
+    }
+#endif
+
     ESP_ERROR_CHECK(app_core_start());
     panda_touch_set_callback(app_core_post_touch);
 
     panda_connectivity_set_callbacks(app_core_set_wifi_status, app_core_set_time_from_epoch);
     const panda_settings_t *wifi_cfg = panda_settings_get();
-    err = panda_connectivity_init(wifi_cfg->wifi_ssid, wifi_cfg->wifi_pass);
+    err = panda_connectivity_init(wifi_cfg->wifi, wifi_cfg->wifi_count);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "connectivity init failed: %s", esp_err_to_name(err));
     }
@@ -82,23 +92,12 @@ void app_main(void)
     }
 
 #if CONFIG_PANDA_PROVISIONING
-    /* The config page is only reachable while the SoftAP is up. Start it at
-     * boot only when there are no credentials to connect with; otherwise
-     * app_core opens it when the AP is enabled and closes it when it stops. */
-    if (wifi_cfg->wifi_ssid[0] == '\0') {
-        err = app_provisioning_start();
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "provisioning unavailable: %s", esp_err_to_name(err));
-        }
-    } else {
-        ESP_LOGI(TAG, "provisioning page idle (use 'wifi ap on' when needed)");
-    }
-#endif
-
-#if CONFIG_PANDA_SERIAL_CLI
-    err = serial_cli_init();
+    /* The page is served whenever the device has a network: over the SoftAP
+     * at 192.168.4.1 or over the LAN at the STA IP (music upload, WiFi and
+     * voice settings). app_core stops it only when both are down. */
+    err = app_provisioning_start();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "serial CLI unavailable: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "provisioning unavailable: %s", esp_err_to_name(err));
     }
 #endif
 

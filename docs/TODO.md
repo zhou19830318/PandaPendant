@@ -13,10 +13,12 @@
 - [x] 已完成并有验证证据
 - [!] 阻塞
 
-## 当前构建状态（2026-11-10）
+## 当前构建状态（2026-11-13）
 
-- `idf.py build` 通过：`panda_ai.bin` 0x804590（约 8.0MB），factory 10MB 剩余约 20%；
-  `project(panda_ai VERSION 2.0.0)`。
+- `idf.py build` 通过：`panda_ai.bin` 0x82db70（约 8.20MB），factory 10MB 剩余 18%
+  （0x1d2490）；`project(panda_ai VERSION 2.0.0)`；已烧录 `/dev/ttyACM0`。
+- 新增 `CONFIG_LV_FONT_MONTSERRAT_48=y`（`sdkconfig.defaults`）供音乐页 48px 图标，
+  bin 因此增加约 96KB。
 - 配网页改为按需运行：仅 SoftAP 开启时启动，SoftAP 关闭即停止；有凭证正常启动时
   日志为 `provisioning page idle (use 'wifi ap on' when needed)`。
 - 串口 CLI 已接入：status/ui/touch/brightness/volume/battery/time/settings/voice/audio/weather/rgb/i2c/sdcard/rtc/wifi/heap/reboot；
@@ -24,7 +26,88 @@
   `ui images` 可无屏检查 37 屏的图片解码（37 屏/71 对象/58 唯一/0 失败）；
   `voice stats` 输出 WS/TTS 计数器，`wifi status` 增加 `ap_auto`/`reason`/`retry`；
   `weather [show|refresh|set <city>]` 查询/刷新/设置天气城市；
-  `audio tone [seconds]` 连续 880Hz 音；`voice pump on|off` 开关上行静音泵（诊断用）。
+  `audio tone [seconds]` 连续 880Hz 音；`voice pump on|off` 开关上行静音泵（诊断用）；
+  `mp3 status|list|play [index]|toggle|next|prev|stop`，`mp3 status` 额外输出
+  `audio_rate/underruns/buffered/flags`（flags：bit0 primed、bit1 eof、bit2 idle、bit3 abort）。
+
+## 本轮：播放中音量键 + 音乐页图标（2026-11-13 真机验证）
+
+- [x] **播放中音量键失效**：根因是音量写 codec 用了 MP3 写入端持有的 `s_tx_lock`，
+  prio 9 持锁方不会让出给 prio 5 的 `app_core` → 饿死。新增独立 `s_ctl_lock`
+  （200ms 超时），锁序统一 tx→rx→ctl。真机 44.1k 播放中 `audio 0–7 ms`、
+  `dac_reg` 0x8a→0x80→0x8a、`underruns=0 buffered=32768`；
+  修复前同一操作 `audio 5799 ms` + `loop stall 5803 ms`。
+- [x] KEY1/KEY2 改为按下即生效 + 按住每 250ms 重复 + 长按也算一步
+  （原来必须等松手，按住反而完全不动）。
+- [x] 诊断：`status` 增加 `app: loops/max_gap/age`；循环停顿 >200ms 打印
+  `loop stall N ms in <stage>`；UI 拿显示锁 >150ms 打警告。
+- [x] 音乐页把“音乐播放”四字换成 88px 圆形徽章 + 48px `LV_SYMBOL_AUDIO`：
+  编译通过、烧录后 `key 3`×7 到页无异常/复位，字体 cmap 已确认含 U+F001
+  （glyph 48×49px）；**用户真机目视确认图标正常、位置合适**，占位无需再调。
+- [x] 构建：`idf.py build` → 0x82db70，factory 剩余 18%（0x1d2490）；已烧录。
+
+## 本轮：多 WiFi / 音乐播放页 / 网页上传 / MP3 音质修复（2026-11-13 真机验证）
+
+- [x] 多 WiFi 凭证：设置层最多保存 4 组 SSID，新增/覆盖/删除均写 NVS；配网页列出
+  全部已存网络、支持扫描周边 WiFi 后选择。真机：页面加载/保存/删除正常，设备启动
+  即连上已存网络（页面与 STA 共用同一份 NVS 数据）。
+- [~] 启动选最强信号：`panda_connectivity` 扫描全信道后，在已存列表内按 RSSI 选最优，
+  扫描失败沿用上次成功凭证重试。缺口：未构造“两个已存 AP 同时在线”的 A/B 场景；
+  补验：保存两个 SSID，先只开弱 AP 启动，再开强 AP 重启，`wifi status` 应显示
+  强 AP 的 BSSID/RSSI。
+- [x] 音乐播放页：KEY3 菜单新增“音乐播放”，扫描 `/sdcard/Music`，显示序号/标题/状态，
+  上一首/暂停/下一首；退出页面调用 `panda_mp3_stop()` 并恢复 16 kHz 语音时钟。
+  真机：`mp3 list` → 46 首；用户通过页面实际播放（听感确认见下）；
+  暂停/继续/切歌由串口 `mp3 toggle|next` 注入同一后端验证（日志 `paused`/`resumed`、切歌）。
+- [x] 网页上传音乐：`POST /upload/music`（≤20MB、仅 `.mp3`、中文名保留），16KB
+  扇区对齐缓冲让 FatFs 走多块 DMA。真机批量上传 42/42 成功，约 330–360KB/s，
+  `sdcard ls` 字节数与源文件一致。
+- [x] **MP3 卡顿/爆音修复**：解码与 I2S 写入拆成两个任务，中间加 32K 样本 PSRAM
+  环形缓冲（16K 预缓冲 ≈0.34s@48k / 0.37s@44.1k，环满 0.67–0.74s）；仅在一首开始、
+  写入端空闲且静音时切换一次采样率，播放中不再重配 codec；起播/续播/切歌淡入、
+  曲尾淡出；90ms 排空等待覆盖 65ms DMA 深度；欠载计数可查。
+  真机（`/dev/ttyACM0`）：
+  - 44.1k 曲目：连续播放，`audio_rate=44100 underruns=0 buffered=32768 flags=0x1`。
+  - 48k 曲目（`挪威的森林`）：`audio_rate=48000 underruns=0 buffered=32768`；
+    `mp3 stop` 后 `audio rate -> 16000 Hz (mic=yes)`、`underruns=0`。
+  - 用户听感确认：“没有卡顿和爆破音了”。
+- [x] 修复中发现的 WDT：TX 任务在“文件读完且已排空”分支无延时忙等，优先级
+  高于解码任务，饿死 core1 IDLE1 并触发任务看门狗；改为 5ms 休眠，并保证
+  abort/idle 握手顺序（先清 `s_abort` 再置 `s_tx_idle`）。
+- [x] 构建：`idf.py build` → `0x815960`，19% free，已烧录并真机验证。
+- [~] SD 卡残留两个测试上传文件（`64k.mp3` 65536B、`test1m.mp3` 1048576B），
+  播放约 0.8s/12s 后自动跳下一首；属卡内容，可在配网页删除，不影响固件。
+
+## 本轮：配网页可达性 / 误触语音 / 空语音兜底（2026-11-11 真机验证）
+
+- [x] 配网页自愈：`app_core.c` 周期任务核对 SoftAP 与 HTTP 状态，AP 在而页面
+  未运行时重试（2s）；AP 开启边沿 toast 并记录 URL。
+- [x] **页面截断根因**：`send_chunk()` 对空字符串发 0 长度块 = 结束响应。
+  未填 App ID 或 STA 无 IP 时页面在半个 HTML 处结束。现在空串直接跳过。
+  真机 `GET /` → 200、4094B、以 `</html>` 结尾。
+- [x] **httpd 任务栈**：AP 启动后内部堆碎片化，8KB 栈创建任务失败
+  （`ESP_ERR_HTTPD_TASK`），IDF 该路径不关监听 socket → 之后永久
+  `listen (112)`。改为 4KB 栈、3KB 转义缓冲移 PSRAM、启动前检查
+  `largest_internal >= stack+2KB`。真机 `largest_internal` 仅 3.5–7.7KB，
+  页面仍稳定启动。
+- [x] SoftAP 信道：STA 未连接时固定信道 1；AP_START 日志打印真实 IP/信道。
+- [x] httpd 容忍慢连接：`max_open_sockets=4`、`backlog_conn=4`、收/发超时 10s。
+- [x] 真机配网验收：`wifi ap on` → `SoftAP started ... ip=192.168.4.1 ch=6`、
+  `provisioning ready`；`wifi status` → `softap: on`、`provision: on`；
+  `/api/status` 200、`POST /save` 200、`/generate_204` 302；
+  `wifi ap off` → 页面停止、softap off；连续两轮开关均正常，无端口泄漏。
+- [x] 误触/静音 PTT 语音提醒（2026-11-11 真机）：150ms 轻触与 1s 静音长按均为
+  `speech_frames=0` → `no speech (no sustained speech)` → `no-speech prompt sent`
+  → `tts started voice=chat_tts_text` → `play drain complete` → idle，听到提示音。
+- [x] 空语音错误抑制（2026-11-11 真机）：上述两轮均未出现 `error_llm` 错误屏。
+- [x] 说话判定：RMS 250 / 8 帧（320ms）+ 按下后 120ms 爆音守卫。实测 150ms 轻触
+  由旧版 `peak=9552 speech_frames=6` 降为 `peak=90 speech_frames=0`。
+- [x] 提示文本回合改用 demo 的 `speech_text_buffer.append/commit` + `speech_id`
+  （旧 `replacement.*` 缺 speech_id，服务端不响应，20s 后状态机弹错误屏）；
+  另加 10s 提示无响应回 idle 的看门狗。
+- [x] 构建：`idf.py build` → `0x805360`，20% free，已烧录并真机验证。
+- [x] 语音 WS 403 已解除：原因是火山账号欠费；充值后主机握手返回
+  `101 Switching Protocols`，真机 `websocket connected`，`voice clip` 全链路通过。
 
 ## 本轮：圆形屏边缘裁切修复（2026-11-10，已烧录）
 - [x] 审计 37 个生成屏：正文/列表/标题字形均在 r≈180 内（仅 11 个标题与 2 个

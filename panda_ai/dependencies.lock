@@ -1,4 +1,14 @@
 dependencies:
+  chmorgan/esp-libhelix-mp3:
+    component_hash: cbb76089dc2c5749f7b470e2e70aedc44c9da519e04eb9a67d4c7ec275229e53
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.3
   espressif/esp_codec_dev:
     component_hash: df70f10af8d7b922add7b9d07372c9c97ab356e58d72b7a892050227c2d44348
     dependencies:
@@ -101,6 +111,13 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.11.1
+  espressif/qrcode:
+    component_hash: 3b493771bc5d6ad30cbf87c25bf784aada8a08c941504355b55d6b75518ed7bc
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.1.0~2
   idf:
     source:
       type: idf
@@ -113,6 +130,7 @@ dependencies:
       type: service
     version: 9.5.0
 direct_dependencies:
+- chmorgan/esp-libhelix-mp3
 - espressif/esp_codec_dev
 - espressif/esp_io_expander
 - espressif/esp_io_expander_tca95xx_16bit
@@ -121,8 +139,9 @@ direct_dependencies:
 - espressif/esp_websocket_client
 - espressif/led_strip
 - espressif/mdns
+- espressif/qrcode
 - idf
 - lvgl/lvgl
-manifest_hash: a6f6ae6bb58badb371afc9a0bb5a675b37dcf3182e3bf02bdf553eb7d266a6fc
+manifest_hash: 63216a8e20076a352af22b4d65c73a01e0dd4cf6d2a42e4f10b008fb5ca68231
 target: esp32s3
 version: 2.0.0

@@ -552,3 +552,240 @@ TCA9555 的输出锁存器复位值为 `0xFF`。初始化必须先 `set_dir(out_
 - 仿真器（`tools/ui_sim/web`）要同步这些数值；浏览器会缓存 `app.js`，
   换主机名（`127.0.0.1` ↔ `localhost`）或加 version 参数可强制刷新，
   改完务必用 DOM 矩形核对，不要只看旧截图。
+
+## 13. 配网可达性 / 静默回合（2026-11-10，代码完成待真机）
+
+### 配网页不能只依赖 AP 边沿事件
+- 旧逻辑在 WiFi 事件队列收到 `AP_START` 时才启动 httpd；边沿事件被合并、UI 忙或
+  httpd 启动失败后，热点在但页面永久不可达。
+- 现在 `app_core` 周期任务每秒核对 `panda_connectivity_is_ap()` 与
+  `app_provisioning_is_running()`，不一致就重试/停止；失败重试间隔 5s。
+- 诊断：日志 `SoftAP started: ... ip=192.168.4.1 ch=1` 与
+  `provisioning ready: http://.../` 应成对出现；`wifi status` 有 `softap/provision/ap_auto`。
+
+### SoftAP 信道必须固定 1（STA 断开时）
+- APSTA 下 SoftAP 跟随 STA 信道；STA 未连接时若沿用上次关联的 12/13，
+  部分手机（尤其把 12/13 视为禁用）会连不上或连上无门户。
+- 现为 `ap.channel = (s_connected && s_sta_channel) ? s_sta_channel : 1`。
+
+### 手机门户探测需要更长的 HTTP 超时
+- 默认 recv/send 5s 对 Android 的 captive portal 探测偏短，改为 10s；
+  `max_open_sockets=4`、`backlog_conn=4`，避免探测连接占满后页面打不开。
+
+### 静音回合不要 commit 上行音频
+- PTT 释放时若持续语音帧 < 4（RMS 250/40ms 帧），旧代码仍 `commit`，服务端对
+  纯静音回 ASR 失败或“服务器开小差，请稍后再试”，用户看到错误屏。
+- 现直接本地收尾：字幕提示 + 不 commit；8s 静默宽限内对兜底文本/TTS/error
+  一律取消并抑制。说话阈值 250/4 帧用于滤掉风扇与手持噪声。
+- 服务端合成语音提醒走 demo 的 `speech_text_buffer.replacement.append` +
+  `replacement.commit`（无音频上传的文本回合）；3s 冷却避免连续误触刷屏，
+  10s 超时允许重试；取消旧响应后 400ms 内的 `response.done/canceled` 不算
+  提醒回合结束，避免误清 `s_prompt_turn`。
+- 残余风险：若静音被误判为语音且服务端兜底 TTS 已开始，取消前可能漏出极短音频，
+  但不会再显示错误屏。
+
+### 空字符串 chunk 会提前结束配网页（2026-11-11 真机）
+- `httpd_resp_send_chunk(req, "", HTTPD_RESP_USE_STRLEN)` 的长度为 0，按协议就是
+  “最后一个块”，响应立即结束。
+- 页面里的可选值（未填 App ID、STA 未连接时的 IP）会传入空串，于是 HTML 在
+  `<input ... value="` 处被截断；手机看起来就是“页面打不开”。
+- 现在 `send_chunk()` 对空串直接返回 ESP_OK。真机整页 4094B，以 `</html>` 结尾。
+
+### httpd 任务栈与监听 socket 泄漏（2026-11-11 真机）
+- 实测 AP 开启后内部堆总量约 10–22KB，但最大连续块只有 3.5–7.7KB。
+  8KB 栈的 httpd 任务创建失败（`ESP_ERR_HTTPD_TASK`）；IDF 的 `httpd_start`
+  在该路径只释放结构体，**不 close 监听 fd**，之后重试 bind 成功但
+  `listen` 返回 112（新 libc 的 `EADDRINUSE`），配网页永久起不来。
+- 处理：httpd 栈降到 4KB（默认值；大缓冲都已在 PSRAM 堆），
+  `index_get` 的 3KB 转义缓冲改为 PSRAM 分配；启动前要求
+  `largest_internal >= stack_size + 2KB`，不满足就延后，避免进入泄漏路径；
+  自愈重试 2s。`heap` CLI 增加 `largest_internal` 便于诊断。
+- 代价：配网页运行时占用约 10KB 内部 RAM，天气刷新会因内部堆门槛跳过（可接受）。
+
+### 语音 WS 403 = 账号欠费（2026-11-11 真机 + 主机复现，已解除）
+- `esp-x509-crt-bundle: Certificate validated` 后立即
+  `Sec-WebSocket-Accept not found` + `handshake_status_code=403`，每 5s 重试均失败。
+- WiFi 有 IP、DNS/SNTP 正常，代码与 2026-11-10 12/12 通过版本一致；JSON 模式
+  只用 `X-Api-Key`（与厂商 demo 一致），不是固件改动导致。
+- 用同一 Key 在主机侧直接对 `openspeech.bytedance.com:443` 发 WS 握手，复现同样
+  403，响应体明确：
+  `{"error":{"type":"Forbidden","code":"45000030","message":"[resource_id=volc.speech.dialog] requested resource not granted"}}`。
+- 额外测试：加 `X-Api-Resource-Id: volc.speech.dialog`、再加固定
+  `X-Api-App-Key: PlgvMymc7f3tQnJ6`，仍是同一 403 → 与请求头无关。
+- 结论：账号欠费时服务端把“资源未授权（45000030）”作为拒绝理由，容易误判为
+  Key 失效/应用未开通。充值后同一 Key 主机握手立即 `101 Switching Protocols`，
+  真机 `websocket connected`，无需重录或换 Key。排查顺序应是：先看账单/欠费，
+  再看 Key 所属应用与资源授权。
+- 该 Key 曾出现在聊天中，恢复后仍建议轮换。
+
+### JSON 文本回合必须带 speech_id（2026-11-11 真机）
+- 无语音提示原用 `speech_text_buffer.replacement.append/commit`，只带 event_id/text，
+  服务端不回任何响应；10–20s 后 `panda_state` 的 `THINKING_MS=20000` 超时把
+  `PANDA_STATE_ERROR_LLM` 画成“服务开小差了”错误屏。
+- demo 的独立文本回合是 `speech_text_buffer.append` + `speech_text_buffer.commit`，
+  两条都带同一个 `speech_id`（commit 的 `text` 为空）。改后 `tts started
+  voice=chat_tts_text` 在 1–2s 内到达，`play drain complete` 后回 idle。
+- 另加看门狗：`s_prompt_turn` 超过 10s 无响应直接回 idle，避免状态机兜底错误屏。
+
+### 误触判定要防按压爆音（2026-11-11 真机）
+- 150ms 轻触实测 `peak=9552 rms=2952 speech_frames=6`（RMS 250/4 帧判定成说话），
+  说明按压/触摸本身会给麦克风一个瞬态，不能只靠整体 RMS。
+- 处理：PTT 按下后 120ms 内的帧不统计也不上行；判定帧数 4→8（320ms）。
+  同一轻触变为 `peak=90 rms=28 speech_frames=0`，稳定进入无语音提示分支。
+- 代价：PTT 开头约 120ms 被裁掉，正常说话仍可识别；短于 ~440ms 的有效说话会被
+  当作误触并得到语音提醒。
+
+
+
+## 14. SD 卡音乐上传：栈、扇区对齐与缓冲区（2026-11-13 真机）
+
+### httpd 任务栈 4KB 会在 1MB 左右溢出复位
+- `POST /upload/music` 传大文件时出现 `***ERROR*** A stack overflow in task httpd`，
+  `rst:0xc (RTC_SW_CPU_RST)`，客户端 `curl (56) Recv failure`，SD 上留下 0 字节文件。
+- 打开文件与目录项在 `open()` 时已落盘，崩溃时 `close()` 未执行，所以目录里能看到
+  文件名但 size=0；不能把这种文件当成“已上传”。
+- `app_provisioning_start()` 的 `config.stack_size` 4KB → 8KB 后，11.2MB 文件稳定通过。
+  内部堆已从 ~10KB 恢复到 ~118KB（见 §15），8KB 栈 + 2KB 余量检查可通过。
+
+### FatFs 只有在“文件偏移扇区对齐且整扇区写”时才走多块 DMA
+- 现象：11MB 文件上传前 4MB 约 330KB/s，之后掉到 8.7KB/s；串口计时显示
+  `recv 194ms / write 117550ms`，单次 `write(8KB)` 最长 1106ms。
+- 原因：TCP 窗口 5760 → `httpd_req_recv()` 每次约 5.7KB；第一次写后
+  `fp->fptr % 512 != 0`，此后 FatFs 每个 512B 扇区单独 `disk_write(..., 1)`，
+  SA02G（SDSC，1-bit/20MHz）单块约 58ms，16 块≈0.9–1.1s。
+- 修复：上传循环先填满 16KB（`heap_caps_aligned_alloc(4096, 16384, MALLOC_CAP_DMA)`）
+  再 `write()`，只在最后一次写尾块。文件偏移始终是 512 的倍数，FatFs 走多块 DMA。
+- 实测（idle）：
+  - 8.2MB → 22.1s（372KB/s），`{"ok":true,"bytes":8219359}`
+  - 11.2MB → 31.3s（353KB/s），`max write 302ms`
+  - 42 首批量约 330KB/s/首，10MB 约 30s。
+- 上传日志每 MiB 输出 `@NNN KB/s (recv X ms, write Y ms, max A/B ms)`，可直接区分
+  网络慢还是卡慢。
+
+### 缓冲区与名称
+- PSRAM 缓冲会被 SDMMC 拒绝（DMA 不能寻址 PSRAM），退化为单扇区 ~8KB/s；
+  日志打 `no internal DMA buffer, upload will be slow`。必须用 `MALLOC_CAP_DMA`。
+- `httpd_query_key_value()` 返回未解码的百分号串，中文名三字节/字，必须
+  `url_decode()`（`%XX` 与 `+`）；网页用 `encodeURIComponent()`，
+  主机脚本用 `urllib.parse.quote(name, safe='')`（保留别的 `+` 会被解码成空格）。
+- 文件名白名单只保留 basename，过滤 `\ ? & % * : " < > |` 与控制字符，仅接受 `.mp3`。
+- `sdcard ls` 现在输出 `FILE <size> <name>`，可直接核对上传字节数；内部 `stat`
+  路径缓冲需 ≥512B，否则长中文名被截断、size 显示 -1。
+
+### TCP 窗口不是当前瓶颈
+- `CONFIG_LWIP_TCP_WND_DEFAULT=5760`，11.2MB 上传中 recv 累计 16.1s、write 12.1s，
+  两者接近；若后续要更快，可把 TCP 窗口/发送缓冲提到 16–32KB 再测。
+
+## 15. 内部 RAM 恢复：LVGL 池与 MP3 表移到 PSRAM（2026-11-13 真机）
+
+- 症状：TLS `esp-aes: Failed to allocate memory`、天气因“内部堆 <28KB”跳过、
+  音乐扫描返回 0 首（FATFS/LFN 分配失败）。实测启动后内部堆仅 ~10KB、最大块 4.8KB。
+- 根因：LVGL 9.5 内置分配器在 `.bss` 里放 96KB 静态池（`LV_MEM_ADR=0` 的
+  `work_mem_int`），MP3 组件还有 2×64×96B 曲目表（12.5KB）也在 `.bss`。
+- 修复：
+  - `LV_MEM_POOL_INCLUDE` + `LV_MEM_POOL_ALLOC` 把 LVGL 池改从 PSRAM 堆分配，
+    实现 `panda_lvgl_pool_alloc()` 放在 `panda_ui`，头文件 `lvgl_mem_pool.h`。
+  - `panda_mp3` 的曲目表改为 PSRAM 数组（首次使用时分配）。
+- 效果：启动 `internal=118315 min_internal=105555`；上传时 `internal≈94–103KB`；
+  TLS 正常握手，`websocket connected`，天气正常。
+
+### CMake / 链接坑位
+- 托管组件名是 `lvgl__lvgl`，不是 `lvgl`；
+  `idf_component_get_property(lvgl_lib lvgl__lvgl COMPONENT_LIB)`。
+- `target_compile_definitions()` 会**静默丢弃**函数式宏（`NAME(x)=...`）。
+  必须传普通宏 `LV_MEM_POOL_ALLOC=panda_lvgl_pool_alloc`，再让 LVGL 通过
+  `LV_MEM_POOL_INCLUDE` 包含声明该函数的头文件。
+- `panda_ui`/`main` 的静态库先于 lvgl 扫描，函数会被丢掉；在 lvgl 目标上加
+  `INTERFACE "-u" "panda_lvgl_pool_alloc"` 强制保留。
+
+## 16. MP3 卡顿/爆音：双任务 + 环形缓冲 + 单次采样率切换（2026-11-13 真机）
+
+### 先排除共享通路
+- 豆包 TTS 同一 I2S/codec/DMA 通路无卡顿，说明硬件与 `panda_audio_play()` 本身没问题，
+  缺陷只在 MP3 播放实现。对照 AIWearable（成熟参考）与 AIWatch_Ver3.0（踩坑记录）。
+
+### 旧实现的三处根因
+1. **解码与 I2S 写耦合**：解码任务直接调用 `panda_audio_play()`（持 `s_tx_lock` 阻塞），
+   SD 卡单次读抖动（几十 ms）会立刻表现为 DMA 饿死 → 断音/爆点。
+   I2S DMA 深度 12×240≈2880 帧，48k 下仅约 60ms，没有缓冲余量。
+2. **每首开头重配 codec**：文件采样率与当前时钟不同就 `set_rate()`，会关闭/重开
+   ES8311/ES7210 与 I2S，必然产生间隙和 pop。AIWatch 的结论是播放中不要重配，
+   宁可保持 48k 重采样；本项目曲库只有 44.1k/48k，改为**只在每首开始、写入端
+   空闲且静音时切换一次**，播放中不再动时钟。
+3. **无预缓冲、无淡入淡出**：起播/欠载处是 PCM 阶跃，直接听成“爆破音”。
+
+### 新结构
+- 解码任务 prio 8 只做：读文件 → MP3 解码 → 立体声下混 → 推入 32K 样本环形缓冲
+  （PSRAM，互斥锁）。写入任务 prio 9 只做：从环取 1024 样本 → `panda_audio_play()`。
+- 预缓冲 16K 样本（≈0.34s@48k、0.37s@44.1k）后才开始写；整环 32K 样本
+  （0.67–0.74s），可吸收 SD 卡的长尾延迟。
+- 淡入 441 样本（10ms）用于起播/续播/欠载恢复；曲尾最后一块做 10ms 淡出；
+  写完后等 90ms（> 65ms DMA 深度）再宣告 idle，保证尾音真正播出。
+- 切歌：解码端置 `s_abort`，写入端淡出丢弃环内容并排空，解码端等 `s_tx_idle`
+  后重开文件/解码器。**握手顺序必须是先 `s_abort=false` 再 `s_tx_idle=true`**，
+  否则解码端可能看到上一轮的 abort，误判为停止。
+- 欠载时 `s_underruns++` 并强制下一次写入淡入，避免连续爆点。
+
+### 任务看门狗坑（本次真机复现）
+- 现象：播放到文件末尾后 `task_wdt: Task watchdog got triggered ... IDLE1`，
+  backtrace 在 `ring_pop`/`mp3_tx_task`；`mp3 status` 显示 `buffered=0`、曲目不再前进。
+- 原因：`s_eof && s_tx_idle` 的“环空且已排空”分支没有延时，prio 9 任务在 core1 忙等，
+  既饿死 IDLE1，也让 prio 8 解码任务拿不到 CPU（无法切下一首）。
+- 规则：任何“等待条件”的分支都必须 `vTaskDelay`（这里 5ms）；优先级只比解码高
+  一级，避免写入端把解码端完全压死。
+
+### 观测方法
+- `mp3 status` 输出：`audio_rate`、`underruns`、`buffered`（样本数）、
+  `flags`（bit0 primed / bit1 eof / bit2 idle / bit3 abort）。
+- 稳定播放应为 `buffered=32768`（环满）、`underruns=0`、`flags=0x1`；
+  曲尾短暂 `0x5`；停止后 `flags=0x4`。`underruns` 持续增长说明 SD 读取或解码跟不上。
+- `panda_audio_set_rate()` 期间的 `i2s_channel_disable: the channel has not been
+  enabled yet` 是 esp_codec_dev 关闭数据面的既有噪声，不影响播放。
+- 实测：44.1k 与 48k 曲目均 `underruns=0`；用户听感确认无卡顿/爆音。
+
+## 17. 播放中音量键失效：prio 9 写入端饿死 app_core（2026-11-13 真机）
+
+### 现象与证据
+- MP3 播放中按 KEY1/KEY2 没反应；暂停后立刻能调。
+- 修复前日志：`app: button 1 down` → `app: key volume=30% (audio 5799 ms ESP_OK, ui 0 ms)`
+  并伴随 `app: loop stall 5803 ms`。按键确实被处理了，但卡在 codec 音量写入 5.8s。
+
+### 根因
+- `panda_audio_set_volume()` 用 `portMAX_DELAY` 等 I2S 写入任务（prio 9, core1）
+  几乎持续持有的 `s_tx_lock`。
+- 持锁任务优先级高于 `app_core`（prio 5）。FreeRTOS 的 `xSemaphoreGive()` 只在
+  等待者优先级更高时才让出 CPU；这里等待者更低，写入端下一轮 `xSemaphoreTake()`
+  又先拿回刚释放的锁 → 等待者被无限饿死，直到播放暂停/切歌出现空档。
+- 同一坑的另一种表现：播放中连按 `key 3` 翻页到第 5 页会卡住（持显示锁的路径里
+  去写音量）。
+
+### 规则
+- codec 寄存器访问（音量/静音/回读）与 I2S 数据通路分开加锁；控制锁 200ms 超时，
+  超时直接返回 `ESP_ERR_TIMEOUT`（切采样率会重开 codec 并重新套用 `s_volume`，
+  丢一次写没有副作用）。
+- 全局锁序固定 `s_tx_lock → s_rx_lock → s_ctl_lock`；音量只取 `s_ctl_lock`，不成环。
+- 低优先级任务不要用 `portMAX_DELAY` 去等高频高优先级任务持有的锁。
+
+### 按键响应
+- 音量键按下即触发，按住每 250ms 重复；松手不再补一次（`s_btn_vol_fired` 抑制）。
+- 诊断入口：`status` 的 `app: loops=… max_gap=…ms age=…ms`；停顿时打印
+  `loop stall N ms in <stage>`（keys/events/music/voice-ui/1hz/menu-sync/battery），
+  可直接定位是哪一段卡住。
+
+## 18. 界面中文字号不一致与音乐页图标（2026-11-13）
+
+### “音乐播放”四个字大小不一
+- `ui_font_Title22` 是 SquareLine 按 `--symbols` 清单裁出来的 22px 子集：含 音/播/放，
+  **不含 乐**；该字体 `.fallback = &ui_font_CJK16`，缺字回退到 16px，
+  于是三个字 22px、一个字 16px。
+- 规则：往界面加中文文案前先确认所用字体子集包含全部字符；否则补生成字体，
+  或直接用 `ui_font_CJK16` 这类全字库字体。
+
+### 大图标用 Montserrat 符号字体
+- `LV_SYMBOL_AUDIO`(U+F001) 在 `lv_font_montserrat_28/48` 的 sparse cmap 里
+  （`unicode_list` 存的是相对 `range_start=176` 的偏移：0xef51+176=0xF001）。
+- 需要 48px 时在 `sdkconfig.defaults` 加 `CONFIG_LV_FONT_MONTSERRAT_48=y`（+96KB），
+  **不要手改 `sdkconfig`**。已有本机 sdkconfig 时先 `idf.py save-defconfig`
+  把覆盖项存到临时文件，再用
+  `idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;/tmp/local.defaults" reconfigure`
+  重建，并 diff 确认只多目标一行。

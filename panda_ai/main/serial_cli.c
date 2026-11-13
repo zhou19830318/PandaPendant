@@ -11,6 +11,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include <inttypes.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "esp_console.h"
 #include "esp_log.h"
@@ -28,6 +30,7 @@
 #include "app_provisioning.h"
 #include "panda_display.h"
 #include "panda_touch.h"
+#include "panda_mp3.h"
 #include "panda_ui.h"
 
 static const char *TAG = "cli";
@@ -120,6 +123,12 @@ static int cmd_status(int argc, char **argv)
            info->i2c_ok ? "ok" : "fail", info->ioexp_ok ? "ok" : "fail",
            info->rtc_ok ? "ok" : "fail", info->sdcard_ok ? "mounted" : "none",
            info->rgb_ok ? "ok" : "fail", info->boot_count);
+    uint32_t loops = 0;
+    uint32_t max_gap = 0;
+    uint32_t age = 0;
+    app_core_loop_stats(&loops, &max_gap, &age);
+    printf("app      : loops=%" PRIu32 " max_gap=%" PRIu32 "ms age=%" PRIu32 "ms\n",
+           loops, max_gap, age);
     printf("heap     : free=%zu internal=%zu psram=%zu\n",
            (size_t)esp_get_free_heap_size(),
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -476,9 +485,20 @@ static int cmd_settings(int argc, char **argv)
     const char *value = join_args(argc, argv, 3);
     int iv;
     if (!strcmp(key, "wifi_ssid")) {
-        set_string(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), value);
+        if (panda_settings_wifi_put(value, "") != ESP_OK) {
+            printf("wifi list full (max %d)\n", PANDA_WIFI_CRED_MAX);
+            return 1;
+        }
     } else if (!strcmp(key, "wifi_pass")) {
-        set_string(cfg->wifi_pass, sizeof(cfg->wifi_pass), value);
+        if (cfg->wifi_count == 0) {
+            printf("add a network first: settings set wifi_ssid <name>\n");
+            return 1;
+        }
+        /* Applies to the most recently added/edited network. */
+        snprintf(cfg->wifi[cfg->wifi_count - 1].pass,
+                 sizeof(cfg->wifi[0].pass), "%s", value);
+    } else if (!strcmp(key, "wifi_clear")) {
+        panda_settings_wifi_clear();
     } else if (!strcmp(key, "api_mode")) {
         set_string(cfg->api_mode, sizeof(cfg->api_mode), value);
     } else if (!strcmp(key, "app_id")) {
@@ -585,6 +605,10 @@ static int cmd_settings(int argc, char **argv)
         if (!strcmp(key, "weather_city")) {
             app_weather_refresh();
         }
+        if (!strcmp(key, "wifi_ssid") || !strcmp(key, "wifi_pass") ||
+            !strcmp(key, "wifi_clear")) {
+            panda_connectivity_set_credentials(cfg->wifi, cfg->wifi_count);
+        }
     }
     printf("set %s: %s\n", key, esp_err_to_name(err));
     return err == ESP_OK ? 0 : 1;
@@ -658,7 +682,16 @@ static int cmd_audio(int argc, char **argv)
         return err == ESP_OK ? 0 : 1;
     }
     if (argc >= 2 && !strcmp(argv[1], "status")) {
-        printf("ready=%d mic=%d\n", panda_audio_ready(), panda_audio_has_mic());
+        int vol = -1;
+        int mute_reg = -1;
+        int dac_reg = -1;
+        panda_audio_get_volume(&vol);
+        panda_audio_get_codec_reg(0x31, &mute_reg);
+        panda_audio_get_codec_reg(0x32, &dac_reg);
+        printf("ready=%d mic=%d rate=%u volume=%d mute_reg=0x%02x dac_reg=0x%02x\n",
+               panda_audio_ready(), panda_audio_has_mic(),
+               (unsigned)panda_audio_get_rate(), vol,
+               mute_reg < 0 ? 0xFF : mute_reg, dac_reg < 0 ? 0xFF : dac_reg);
         return 0;
     }
     if (argc >= 2 && !strcmp(argv[1], "tone")) {
@@ -738,7 +771,36 @@ static int cmd_sdcard(int argc, char **argv)
         printf("unmount: %s\n", esp_err_to_name(err));
         return err == ESP_OK ? 0 : 1;
     }
-    printf("usage: sdcard status|mount|unmount\n");
+    if (!strcmp(argv[1], "ls")) {
+        const char *path = argc >= 3 ? argv[2] : panda_board_sdcard_mount_point();
+        DIR *dir = opendir(path);
+        if (dir == NULL) {
+            printf("opendir %s failed\n", path);
+            return 1;
+        }
+        struct dirent *ent;
+        int count = 0;
+        while ((ent = readdir(dir)) != NULL) {
+            if (ent->d_name[0] == '.') {
+                continue;
+            }
+            char full[512];
+            struct stat st;
+            snprintf(full, sizeof(full), "%.200s/%s", path, ent->d_name);
+            bool have = stat(full, &st) == 0;
+            bool is_dir = have && S_ISDIR(st.st_mode);
+            if (is_dir) {
+                printf("DIR  %s\n", ent->d_name);
+            } else {
+                printf("FILE %10ld  %s\n", have ? (long)st.st_size : -1L, ent->d_name);
+            }
+            count++;
+        }
+        closedir(dir);
+        printf("%d entries in %s\n", count, path);
+        return 0;
+    }
+    printf("usage: sdcard status|ls [path]|mount|unmount\n");
     return 1;
 }
 
@@ -786,6 +848,11 @@ static int cmd_wifi(int argc, char **argv)
                app_provisioning_is_running() ? "on" : "off",
                panda_connectivity_ap_ip()[0] ? panda_connectivity_ap_ip() : "192.168.4.1");
         printf("ap_auto  : %s\n", panda_connectivity_ap_auto_started() ? "yes" : "no");
+        printf("saved    : %d network(s)\n", panda_settings_wifi_count());
+        for (int i = 0; i < panda_settings_wifi_count(); i++) {
+            const panda_wifi_cred_t *cred = panda_settings_wifi_at(i);
+            printf("  [%d]     : %s\n", i, cred ? cred->ssid : "-");
+        }
         printf("reason   : %u (%s)\n", (unsigned)panda_connectivity_disconnect_reason(),
                panda_connectivity_disconnect_hint());
         printf("retry    : %u ms\n", (unsigned)panda_connectivity_retry_delay_ms());
@@ -810,14 +877,18 @@ static int cmd_wifi(int argc, char **argv)
         const char *ssid = argv[2];
         const char *pass = argc >= 4 ? argv[3] : "";
         panda_settings_t *cfg = panda_settings_get();
-        snprintf(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), "%s", ssid);
-        snprintf(cfg->wifi_pass, sizeof(cfg->wifi_pass), "%s", pass);
-        esp_err_t err = panda_settings_save();
+        esp_err_t err = panda_settings_wifi_put(ssid, pass);
+        if (err != ESP_OK) {
+            printf("save failed: %s (max %d networks)\n", esp_err_to_name(err),
+                   PANDA_WIFI_CRED_MAX);
+            return 1;
+        }
+        err = panda_settings_save();
         if (err != ESP_OK) {
             printf("save failed: %s\n", esp_err_to_name(err));
             return 1;
         }
-        err = panda_connectivity_connect(ssid, pass);
+        err = panda_connectivity_set_credentials(cfg->wifi, cfg->wifi_count);
         printf("connect '%s': %s (use 'wifi status')\n", ssid, esp_err_to_name(err));
         return err == ESP_OK ? 0 : 1;
     }
@@ -828,11 +899,10 @@ static int cmd_wifi(int argc, char **argv)
     }
     if (!strcmp(argv[1], "forget")) {
         panda_settings_t *cfg = panda_settings_get();
-        cfg->wifi_ssid[0] = '\0';
-        cfg->wifi_pass[0] = '\0';
+        panda_settings_wifi_clear();
         esp_err_t err = panda_settings_save();
         if (err == ESP_OK) {
-            err = panda_connectivity_forget();
+            err = panda_connectivity_set_credentials(cfg->wifi, 0);
         }
         printf("forget: %s\n", esp_err_to_name(err));
         return err == ESP_OK ? 0 : 1;
@@ -874,12 +944,58 @@ static int cmd_heap(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    printf("free=%zu internal=%zu psram=%zu min_internal=%zu\n",
+    printf("free=%zu internal=%zu psram=%zu min_internal=%zu largest_internal=%zu\n",
            (size_t)esp_get_free_heap_size(),
            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
            heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-           heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+           heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     return 0;
+}
+
+static int cmd_mp3(int argc, char **argv)
+{
+    if (argc < 2 || !strcmp(argv[1], "status")) {
+        printf("tracks=%d dir=%s state=%s current=%d title=%s audio_rate=%u underruns=%u buffered=%u flags=0x%x\n",
+               panda_mp3_count(), panda_mp3_dir(),
+               panda_mp3_state() == PANDA_MP3_PLAYING ? "playing" :
+               panda_mp3_state() == PANDA_MP3_PAUSED ? "paused" : "idle",
+               panda_mp3_current(), panda_mp3_current_title(),
+               (unsigned)panda_audio_get_rate(), (unsigned)panda_mp3_underruns(),
+               (unsigned)panda_mp3_buffered(), (unsigned)panda_mp3_flags());
+        return 0;
+    }
+    if (!strcmp(argv[1], "list")) {
+        int count = panda_mp3_scan();
+        printf("found %d track(s) in %s\n", count, panda_mp3_dir());
+        for (int i = 0; i < count; i++) {
+            printf("%2d. %s\n", i + 1, panda_mp3_title(i));
+        }
+        return count > 0 ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "play")) {
+        int index = argc >= 3 ? atoi(argv[2]) - 1 : -1;
+        esp_err_t err = panda_mp3_play(index);
+        printf("mp3 play: %s\n", esp_err_to_name(err));
+        return err == ESP_OK ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "toggle")) {
+        esp_err_t err = panda_mp3_toggle();
+        printf("mp3 toggle: %s\n", esp_err_to_name(err));
+        return err == ESP_OK ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "next") || !strcmp(argv[1], "prev")) {
+        esp_err_t err = !strcmp(argv[1], "next") ? panda_mp3_next() : panda_mp3_prev();
+        printf("mp3 %s: %s\n", argv[1], esp_err_to_name(err));
+        return err == ESP_OK ? 0 : 1;
+    }
+    if (!strcmp(argv[1], "stop")) {
+        esp_err_t err = panda_mp3_stop();
+        printf("mp3 stop: %s\n", esp_err_to_name(err));
+        return err == ESP_OK ? 0 : 1;
+    }
+    printf("usage: mp3 status|list|play [index]|toggle|next|prev|stop\n");
+    return 1;
 }
 
 static const esp_console_cmd_t s_commands[] = {
@@ -898,8 +1014,9 @@ static const esp_console_cmd_t s_commands[] = {
     {.command = "wifi", .help = "WiFi: status|scan|connect <ssid> [pass]|disconnect|forget|ap on/off|sync|recover", .func = cmd_wifi},
     {.command = "rgb", .help = "RGB LEDs: rgb <r> <g> <b> | rgb off", .func = cmd_rgb},
     {.command = "i2c", .help = "Scan the board I2C bus", .func = cmd_i2c},
-    {.command = "sdcard", .help = "SD card status/mount/unmount", .func = cmd_sdcard},
+    {.command = "sdcard", .help = "SD card: status|ls [path]|mount|unmount", .func = cmd_sdcard},
     {.command = "rtc", .help = "Read RTC or write: rtc write <epoch>", .func = cmd_rtc},
+    {.command = "mp3", .help = "MP3: status|list|play [index]|toggle|next|prev|stop", .func = cmd_mp3},
     {.command = "reboot", .help = "Restart the device", .func = cmd_reboot},
     {.command = "heap", .help = "Show heap usage", .func = cmd_heap},
 };

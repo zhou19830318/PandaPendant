@@ -9,3 +9,5 @@ dependencies:
   espressif/led_strip: "2.5.5"
   espressif/esp_websocket_client: "1.1.0"
   espressif/mdns: "1.11.1"
+  espressif/qrcode: "^0.1.0"
+  chmorgan/esp-libhelix-mp3: "^1.0.3"

@@ -49,6 +49,7 @@ static const char *TAG = "wifi";
 
 typedef enum {
     WIFI_CMD_RECONNECT = 1,
+    WIFI_CMD_SELECT,
     WIFI_CMD_AP_ON,
     WIFI_CMD_AP_OFF,
     WIFI_CMD_RECOVER,
@@ -72,7 +73,9 @@ static uint32_t s_net_err_count;
 static int64_t s_last_recover_us;
 static volatile bool s_recover_force;
 static bool s_inited;
-static bool s_has_credentials;
+static panda_wifi_cred_t s_creds[PANDA_WIFI_CRED_MAX];
+static int s_cred_count;
+static int s_active_cred = -1;
 static bool s_manual_disconnect;
 static bool s_connected;
 static bool s_ap_enabled;
@@ -88,6 +91,12 @@ static char s_ip[16];
 static char s_ap_ip[16];
 static char s_ssid[33];
 static char s_ap_ssid[33] = CONFIG_PANDA_WIFI_AP_PREFIX;
+
+static bool has_creds(void)
+{
+    return s_cred_count > 0;
+}
+
 
 static void notify_status(void)
 {
@@ -152,7 +161,7 @@ static void recover_now(void)
 {
     bool force = s_recover_force;
     s_recover_force = false;
-    if (s_manual_disconnect || !s_has_credentials) {
+    if (s_manual_disconnect || !has_creds()) {
         return;
     }
     int64_t now = esp_timer_get_time();
@@ -182,7 +191,7 @@ static void recover_now(void)
     for (int i = 0; i < 20 && s_connected; i++) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    if (!s_manual_disconnect && s_has_credentials && !s_connected) {
+    if (!s_manual_disconnect && has_creds() && !s_connected) {
         s_connecting = true;
         notify_status();
         esp_wifi_connect();
@@ -212,6 +221,8 @@ static void recover_now(void)
     }
 }
 
+static void select_and_connect(void);
+
 static void wifi_worker_task(void *arg)
 {
     (void)arg;
@@ -222,14 +233,19 @@ static void wifi_worker_task(void *arg)
         }
         switch (cmd) {
         case WIFI_CMD_RECONNECT:
-            if (!s_manual_disconnect && s_has_credentials && !s_connected) {
-                ESP_LOGI(TAG, "reconnecting (backoff was %" PRIu32 " ms)...", s_retry_delay_ms);
-                esp_wifi_connect();
+            if (!s_manual_disconnect && has_creds() && !s_connected) {
+                ESP_LOGI(TAG, "rescan (backoff was %" PRIu32 " ms)...", s_retry_delay_ms);
+                select_and_connect();
+            }
+            break;
+        case WIFI_CMD_SELECT:
+            if (!s_manual_disconnect && has_creds()) {
+                select_and_connect();
             }
             break;
         case WIFI_CMD_AP_ON:
             if (s_connected || s_manual_disconnect || s_ap_enabled || s_ap_user_off ||
-                !s_has_credentials) {
+                !has_creds()) {
                 break;
             }
             ESP_LOGW(TAG, "no IP after %d s (last reason=%u %s), starting SoftAP '%s' for provisioning",
@@ -268,7 +284,7 @@ static void disarm_ap_fallback(void)
 
 static void arm_ap_fallback(void)
 {
-    if (!s_ap_timer || s_ap_enabled || s_ap_user_off || !s_has_credentials) {
+    if (!s_ap_timer || s_ap_enabled || s_ap_user_off || !has_creds()) {
         return;
     }
     esp_timer_stop(s_ap_timer);
@@ -344,11 +360,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     if (base == WIFI_EVENT) {
         switch (id) {
         case WIFI_EVENT_STA_START:
-            if (s_has_credentials && !s_manual_disconnect) {
+            if (has_creds() && !s_manual_disconnect) {
                 s_connecting = true;
                 notify_status();
-                ESP_LOGI(TAG, "connecting to '%s'...", s_ssid);
-                esp_wifi_connect();
+                ESP_LOGI(TAG, "scanning %d saved network(s) for the best match...",
+                         s_cred_count);
+                post_cmd(WIFI_CMD_SELECT);
                 arm_ap_fallback();
             }
             break;
@@ -371,7 +388,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             if (s_ap_off_timer) {
                 esp_timer_stop(s_ap_off_timer);
             }
-            if (!s_manual_disconnect && s_has_credentials) {
+            if (!s_manual_disconnect && has_creds()) {
                 s_connecting = true;
                 uint32_t delay_ms = next_retry_delay_ms();
                 if (s_retry_timer) {
@@ -386,14 +403,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             notify_status();
             break;
         }
-        case WIFI_EVENT_AP_START:
+        case WIFI_EVENT_AP_START: {
             if (s_ap_stop_timer) {
                 esp_timer_stop(s_ap_stop_timer);
             }
             s_ap_enabled = true;
-            ESP_LOGI(TAG, "SoftAP started: %s%s", s_ap_ssid, s_ap_auto ? " (auto fallback)" : "");
+            esp_netif_ip_info_t ip = {0};
+            char ip_str[16] = "192.168.4.1";
+            if (s_netif_ap && esp_netif_get_ip_info(s_netif_ap, &ip) == ESP_OK && ip.ip.addr) {
+                snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip.ip));
+            }
+            ESP_LOGI(TAG, "SoftAP started: %s%s ip=%s ch=%u",
+                     s_ap_ssid, s_ap_auto ? " (auto fallback)" : "", ip_str,
+                     (unsigned)(s_sta_channel ? s_sta_channel : 1));
             notify_status();
             break;
+        }
         case WIFI_EVENT_AP_STOP:
             if (s_ap_stop_timer) {
                 esp_timer_stop(s_ap_stop_timer);
@@ -433,7 +458,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
         s_connected = false;
         s_ip[0] = '\0';
-        if (!s_manual_disconnect && s_has_credentials) {
+        if (!s_manual_disconnect && has_creds()) {
             s_connecting = true;
             arm_ap_fallback();
         }
@@ -452,9 +477,11 @@ static esp_err_t configure_ap(void)
     size_t ap_len = strnlen(s_ap_ssid, sizeof(ap_cfg.ap.ssid));
     memcpy(ap_cfg.ap.ssid, s_ap_ssid, ap_len);
     ap_cfg.ap.ssid_len = (uint8_t)ap_len;
-    /* In APSTA the SoftAP must share the STA channel; follow the last known
-     * STA channel instead of pinning channel 1. */
-    ap_cfg.ap.channel = s_sta_channel ? s_sta_channel : 1;
+    /* In APSTA the SoftAP must share the STA channel. When the STA link is
+     * down (no-credential or fallback provisioning), pin channel 1 instead of
+     * a stale channel from the last association: phones in some regions hide
+     * or refuse channels 12/13, which made the provisioning AP unreachable. */
+    ap_cfg.ap.channel = (s_connected && s_sta_channel) ? s_sta_channel : 1;
     ap_cfg.ap.max_connection = 4;
     const char *pass = CONFIG_PANDA_WIFI_AP_PASSWORD;
     if (strlen(pass) >= 8) {
@@ -467,16 +494,129 @@ static esp_err_t configure_ap(void)
     return esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
 }
 
-esp_err_t panda_connectivity_init(const char *ssid, const char *password)
+static void copy_credentials(const panda_wifi_cred_t *creds, int count)
+{
+    memset(s_creds, 0, sizeof(s_creds));
+    s_cred_count = 0;
+    if (!creds || count <= 0) {
+        return;
+    }
+    if (count > PANDA_WIFI_CRED_MAX) {
+        count = PANDA_WIFI_CRED_MAX;
+    }
+    for (int i = 0; i < count; i++) {
+        if (!creds[i].ssid[0]) {
+            continue;
+        }
+        s_creds[s_cred_count++] = creds[i];
+    }
+}
+
+static void connect_cred(int index)
+{
+    if (index < 0 || index >= s_cred_count) {
+        return;
+    }
+    const panda_wifi_cred_t *cred = &s_creds[index];
+    snprintf(s_ssid, sizeof(s_ssid), "%s", cred->ssid);
+    s_active_cred = index;
+
+    wifi_config_t sta_cfg = {0};
+    snprintf((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%.*s",
+             (int)(sizeof(sta_cfg.sta.ssid) - 1), cred->ssid);
+    snprintf((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%.*s",
+             (int)(sizeof(sta_cfg.sta.password) - 1), cred->pass);
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    /* Scan every channel and pick the strongest BSSID: multi-AP homes
+     * otherwise associate to a weak repeater and drop constantly. */
+    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_cfg.sta.pmf_cfg.capable = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+
+    wifi_mode_t mode = s_ap_enabled ? WIFI_MODE_APSTA : WIFI_MODE_STA;
+    esp_err_t err = esp_wifi_set_mode(mode);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi mode: %s", esp_err_to_name(err));
+    }
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "sta config: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (s_retry_timer) {
+        esp_timer_stop(s_retry_timer);
+    }
+    s_connecting = true;
+    notify_status();
+    if (s_connected) {
+        esp_wifi_disconnect();
+        for (int i = 0; i < 20 && s_connected; i++) {
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+    }
+    err = esp_wifi_connect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        ESP_LOGW(TAG, "connect: %s", esp_err_to_name(err));
+    }
+}
+
+/* Scan, then join the saved network with the strongest signal. When the scan
+ * succeeds but none of the saved SSIDs is present, bring the provisioning AP
+ * up right away instead of waiting for the 20 s fallback. */
+static void select_and_connect(void)
+{
+    if (s_manual_disconnect || !has_creds()) {
+        return;
+    }
+
+    panda_connectivity_ap_t aps[MAX_SCAN_AP];
+    int n = panda_connectivity_scan_aps(aps, MAX_SCAN_AP);
+    int best = -1;
+    int8_t best_rssi = -128;
+    if (n > 0) {
+        for (int c = 0; c < s_cred_count; c++) {
+            for (int i = 0; i < n; i++) {
+                if (strcmp(aps[i].ssid, s_creds[c].ssid) == 0 &&
+                    aps[i].rssi > best_rssi) {
+                    best_rssi = aps[i].rssi;
+                    best = c;
+                }
+            }
+        }
+    } else {
+        /* A failed scan must not send us to provisioning: keep using the
+         * last credential and let the normal retry backoff handle it. */
+        best = s_active_cred >= 0 ? s_active_cred : 0;
+        ESP_LOGW(TAG, "scan unavailable, trying saved network '%s' directly",
+                 s_creds[best].ssid);
+        connect_cred(best);
+        return;
+    }
+
+    if (best < 0) {
+        ESP_LOGW(TAG, "none of %d saved network(s) in range, provisioning AP on",
+                 s_cred_count);
+        if (!s_ap_enabled && panda_connectivity_ap(true) == ESP_OK) {
+            s_ap_auto = true;
+            s_ap_user_on = false;
+        }
+        return;
+    }
+
+    ESP_LOGI(TAG, "selected '%s' (%d dBm, credential %d/%d)",
+             s_creds[best].ssid, best_rssi, best + 1, s_cred_count);
+    connect_cred(best);
+}
+
+esp_err_t panda_connectivity_init(const panda_wifi_cred_t *creds, int count)
 {
     if (s_inited) {
         return ESP_OK;
     }
 
-    s_has_credentials = ssid && ssid[0];
-    if (s_has_credentials) {
-        snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
-    }
+    copy_credentials(creds, count);
 
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -546,21 +686,8 @@ esp_err_t panda_connectivity_init(const char *ssid, const char *password)
         return ESP_ERR_NO_MEM;
     }
 
-    wifi_config_t sta_cfg = {0};
-    if (s_has_credentials) {
-        snprintf((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%.*s",
-                 (int)(sizeof(sta_cfg.sta.ssid) - 1), ssid);
-        snprintf((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%.*s",
-                 (int)(sizeof(sta_cfg.sta.password) - 1), password ? password : "");
-        sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        /* Scan every channel and pick the strongest BSSID: multi-AP homes
-         * otherwise associate to a weak repeater and drop constantly. */
-        sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-        sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-        sta_cfg.sta.pmf_cfg.capable = true;
-        sta_cfg.sta.pmf_cfg.required = false;
+    if (has_creds()) {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
         s_connecting = true;
     } else {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
@@ -582,7 +709,7 @@ esp_err_t panda_connectivity_init(const char *ssid, const char *password)
     }
 
     s_inited = true;
-    if (!s_has_credentials) {
+    if (!has_creds()) {
         ESP_LOGW(TAG, "no WiFi credentials, SoftAP '%s' password '%s'",
                  s_ap_ssid, CONFIG_PANDA_WIFI_AP_PASSWORD);
     } else {
@@ -592,61 +719,49 @@ esp_err_t panda_connectivity_init(const char *ssid, const char *password)
     return ESP_OK;
 }
 
+esp_err_t panda_connectivity_set_credentials(const panda_wifi_cred_t *creds, int count)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    copy_credentials(creds, count);
+    if (!has_creds()) {
+        return panda_connectivity_forget();
+    }
+    s_manual_disconnect = false;
+    s_ap_user_off = false;
+    return panda_connectivity_reconnect_best();
+}
+
+esp_err_t panda_connectivity_reconnect_best(void)
+{
+    if (!s_inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!has_creds()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_manual_disconnect = false;
+    s_last_reason = 0;
+    s_retry_delay_ms = WIFI_RETRY_MIN_MS;
+    if (s_retry_timer) {
+        esp_timer_stop(s_retry_timer);
+    }
+    s_connecting = true;
+    notify_status();
+    if (!post_cmd(WIFI_CMD_SELECT)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+
 void panda_connectivity_set_callbacks(panda_connectivity_status_cb_t status_cb,
                                       panda_connectivity_time_cb_t time_cb)
 {
     s_status_cb = status_cb;
     s_time_cb = time_cb;
     notify_status();
-}
-
-esp_err_t panda_connectivity_connect(const char *ssid, const char *password)
-{
-    if (!s_inited) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (!ssid || !ssid[0]) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
-    s_has_credentials = true;
-    s_manual_disconnect = false;
-    s_last_reason = 0;
-    s_retry_delay_ms = WIFI_RETRY_MIN_MS;
-
-    wifi_config_t sta_cfg = {0};
-    snprintf((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%.*s",
-             (int)(sizeof(sta_cfg.sta.ssid) - 1), ssid);
-    snprintf((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%.*s",
-             (int)(sizeof(sta_cfg.sta.password) - 1), password ? password : "");
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-    sta_cfg.sta.pmf_cfg.capable = true;
-    sta_cfg.sta.pmf_cfg.required = false;
-    wifi_mode_t mode = WIFI_MODE_STA;
-    if (s_ap_enabled) {
-        mode = WIFI_MODE_APSTA;
-    }
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(mode), TAG, "wifi mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg), TAG, "sta config");
-    if (s_connected) {
-        esp_wifi_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    s_connecting = true;
-    if (s_retry_timer) {
-        esp_timer_stop(s_retry_timer);
-    }
-    arm_ap_fallback();
-    notify_status();
-
-    esp_err_t err = esp_wifi_connect();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-        ESP_LOGW(TAG, "connect: %s", esp_err_to_name(err));
-    }
-    return ESP_OK;
 }
 
 esp_err_t panda_connectivity_disconnect(void)
@@ -677,7 +792,9 @@ esp_err_t panda_connectivity_forget(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_has_credentials = false;
+    memset(s_creds, 0, sizeof(s_creds));
+    s_cred_count = 0;
+    s_active_cred = -1;
     s_ssid[0] = '\0';
     s_manual_disconnect = true;
     s_retry_delay_ms = WIFI_RETRY_MIN_MS;
@@ -706,7 +823,7 @@ esp_err_t panda_connectivity_recover(const char *reason)
     if (!s_inited || !s_worker_q) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!s_has_credentials || s_manual_disconnect) {
+    if (!has_creds() || s_manual_disconnect) {
         return ESP_ERR_INVALID_STATE;
     }
     ESP_LOGW(TAG, "network recovery requested (%s)",

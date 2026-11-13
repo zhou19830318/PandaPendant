@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "panda_connectivity.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,8 +20,9 @@ extern "C" {
 #define PANDA_CITY_MAX 32
 
 typedef struct {
-    char wifi_ssid[PANDA_SSID_MAX];
-    char wifi_pass[PANDA_PASS_MAX];
+    /* Saved WiFi networks, strongest one in range wins at connect time. */
+    panda_wifi_cred_t wifi[PANDA_WIFI_CRED_MAX];
+    int wifi_count;
 
     /* Volcengine Doubao realtime voice */
     char api_mode[12];              /* "o2" (official binary) or "json" */
@@ -60,6 +62,14 @@ esp_err_t panda_settings_save(void);
 esp_err_t panda_settings_reset(void);
 void panda_settings_print(bool include_secrets);
 const char *panda_settings_masked(const char *s);
+
+int panda_settings_wifi_count(void);
+const panda_wifi_cred_t *panda_settings_wifi_at(int index);
+int panda_settings_wifi_index(const char *ssid);
+/* Upsert by SSID; persists only after panda_settings_save(). */
+esp_err_t panda_settings_wifi_put(const char *ssid, const char *pass);
+esp_err_t panda_settings_wifi_remove(const char *ssid);
+void panda_settings_wifi_clear(void);
 
 #ifdef __cplusplus
 }

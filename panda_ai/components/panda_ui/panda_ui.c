@@ -4,9 +4,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_app_desc.h"
 #include "lvgl.h"
+#include "qrcode.h"
 #include "ui.h"
 
 static const char *TAG = "ui";
@@ -68,13 +71,42 @@ static uint32_t s_toast_until;
 static bool s_ui_ready;
 static panda_state_screen_t s_last_screen = PANDA_STATE_SCREEN_BOOT;
 
+/* Provisioning QR page (SoftAP join code plus the 192.168.4.1 URL). */
+static lv_obj_t *s_qr_screen;
+static lv_obj_t *s_qr_canvas;
+static lv_obj_t *s_qr_hint;
+static uint8_t *s_qr_buf;
+static bool s_qr_visible;
+
+/* MP3 page. The decode task lives in panda_mp3; this page only shows state
+ * and forwards touch controls through registered hooks. */
+typedef struct {
+    void (*prev)(void);
+    void (*toggle)(void);
+    void (*next)(void);
+    void (*exit_page)(void);
+} music_hooks_t;
+
+static music_hooks_t s_music_hooks;
+static lv_obj_t *s_music_screen;
+static lv_obj_t *s_music_title_lbl;
+static lv_obj_t *s_music_state_lbl;
+static lv_obj_t *s_music_index_lbl;
+static lv_obj_t *s_music_toggle_lbl;
+
 static void ui_lock(void)
 {
     /* Wait for the LVGL task instead of timing out: the old 1 s timeout
      * returned without the lock and ui_unlock() then gave a semaphore we
      * did not own, corrupting the display lock after a slow render. */
+    int64_t t0 = esp_timer_get_time();
     if (!panda_display_lock(0)) {
         ESP_LOGE(TAG, "display lock unavailable");
+        return;
+    }
+    int64_t dt = esp_timer_get_time() - t0;
+    if (dt > 150000) {
+        ESP_LOGW(TAG, "display lock wait %lld ms", (long long)(dt / 1000));
     }
 }
 
@@ -133,7 +165,8 @@ static bool screen_is_user_page(lv_obj_t *scr)
            scr == ui_sleep_settings || scr == ui_system_settings ||
            scr == ui_system_info || scr == ui_character_preview_1 ||
            scr == ui_character_preview_2 || scr == ui_state_preview ||
-           scr == ui_expression_manager || scr == ui_animation_manager;
+           scr == ui_expression_manager || scr == ui_animation_manager ||
+           scr == s_qr_screen || scr == s_music_screen;
 }
 
 /* These screens already draw their own bottom tip pill; the status overlay
@@ -245,6 +278,289 @@ static void create_overlays(void)
     s_toast_lbl = make_pill_label(s_toast_box);
 
     s_toast_timer = lv_timer_create(toast_timer_cb, 100, NULL);
+}
+
+/* ── Provisioning QR ─────────────────────────────────────────────────── */
+
+/* The generator calls this while we hold the display lock. It rasterises the
+ * modules into an L8 canvas in PSRAM: 200 px with a 2-module quiet zone
+ * stays inside the round bezel when centred slightly above the middle. */
+static void qr_display_cb(esp_qrcode_handle_t qr)
+{
+    int size = esp_qrcode_get_size(qr);
+    if (size <= 0 || s_qr_screen == NULL) {
+        return;
+    }
+    int modules = size + 4;
+    int scale = 200 / modules;
+    if (scale < 3) scale = 3;
+    if (scale > 8) scale = 8;
+    int px = modules * scale;
+    uint32_t stride = lv_draw_buf_width_to_stride((uint32_t)px, LV_COLOR_FORMAT_L8);
+    uint8_t *buf = heap_caps_malloc(stride * (size_t)px, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "QR buffer alloc failed (%d px)", px);
+        return;
+    }
+    memset(buf, 0xFF, stride * (size_t)px);
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            if (!esp_qrcode_get_module(qr, x, y)) {
+                continue;
+            }
+            int px0 = (x + 2) * scale;
+            int py0 = (y + 2) * scale;
+            for (int dy = 0; dy < scale; dy++) {
+                memset(buf + (size_t)(py0 + dy) * stride + px0, 0x00, (size_t)scale);
+            }
+        }
+    }
+    if (s_qr_canvas == NULL) {
+        s_qr_canvas = lv_canvas_create(s_qr_screen);
+        lv_obj_remove_style_all(s_qr_canvas);
+        lv_obj_align(s_qr_canvas, LV_ALIGN_CENTER, 0, -6);
+    }
+    lv_canvas_set_buffer(s_qr_canvas, buf, px, px, LV_COLOR_FORMAT_L8);
+    if (s_qr_buf != NULL) {
+        heap_caps_free(s_qr_buf);
+    }
+    s_qr_buf = buf;
+}
+
+void panda_ui_show_provisioning_qr(const char *ap_ssid, const char *ap_pass, const char *url)
+{
+    if (!s_ui_ready) {
+        return;
+    }
+    ui_lock();
+    if (s_qr_screen == NULL) {
+        s_qr_screen = lv_obj_create(NULL);
+        lv_obj_set_style_bg_color(s_qr_screen, lv_color_hex(0x0B0F14), 0);
+        lv_obj_remove_flag(s_qr_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(s_qr_screen);
+        lv_label_set_text(title, "配网模式");
+        lv_obj_set_style_text_font(title, &ui_font_Title22, 0);
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 40);
+
+        s_qr_hint = lv_label_create(s_qr_screen);
+        lv_obj_set_width(s_qr_hint, 260);
+        lv_label_set_long_mode(s_qr_hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(s_qr_hint, &ui_font_CJK16, 0);
+        lv_obj_set_style_text_color(s_qr_hint, lv_color_hex(0x9AA4AE), 0);
+        lv_obj_set_style_text_align(s_qr_hint, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(s_qr_hint, LV_ALIGN_BOTTOM_MID, 0, -22);
+    }
+
+    if (!s_qr_visible) {
+        if (s_qr_canvas != NULL) {
+            lv_obj_del(s_qr_canvas);
+            s_qr_canvas = NULL;
+        }
+        heap_caps_free(s_qr_buf);
+        s_qr_buf = NULL;
+
+        char payload[160];
+        if (ap_pass != NULL && strlen(ap_pass) >= 8) {
+            snprintf(payload, sizeof(payload), "WIFI:T:WPA;S:%.32s;P:%.64s;;",
+                     ap_ssid ? ap_ssid : "", ap_pass);
+        } else {
+            snprintf(payload, sizeof(payload), "WIFI:T:nopass;S:%.32s;;",
+                     ap_ssid ? ap_ssid : "");
+        }
+        esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+        cfg.display_func = qr_display_cb;
+        cfg.max_qrcode_version = 10;
+        if (esp_qrcode_generate(&cfg, payload) != ESP_OK) {
+            ESP_LOGW(TAG, "QR encode failed");
+        }
+
+        char hint[160];
+        snprintf(hint, sizeof(hint), "扫码加入热点\n%s\n或访问 %s",
+                 ap_ssid ? ap_ssid : "", url ? url : "http://192.168.4.1");
+        lv_label_set_text(s_qr_hint, hint);
+
+        s_qr_visible = true;
+        show_screen(s_qr_screen);
+    }
+    ui_unlock();
+}
+
+void panda_ui_hide_provisioning_qr(void)
+{
+    if (!s_ui_ready) {
+        return;
+    }
+    ui_lock();
+    if (s_qr_visible) {
+        if (lv_screen_active() == s_qr_screen) {
+            show_screen(ui_home);
+        }
+        if (s_qr_canvas != NULL) {
+            lv_obj_del(s_qr_canvas);
+            s_qr_canvas = NULL;
+        }
+        heap_caps_free(s_qr_buf);
+        s_qr_buf = NULL;
+        s_qr_visible = false;
+    }
+    ui_unlock();
+}
+
+bool panda_ui_provisioning_qr_visible(void)
+{
+    return s_qr_visible;
+}
+
+/* ── MP3 page ────────────────────────────────────────────────────────── */
+
+typedef enum {
+    MUSIC_BTN_PREV = 0,
+    MUSIC_BTN_TOGGLE,
+    MUSIC_BTN_NEXT,
+    MUSIC_BTN_EXIT,
+} music_btn_t;
+
+static void music_btn_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    switch ((music_btn_t)(intptr_t)lv_event_get_user_data(e)) {
+    case MUSIC_BTN_PREV:
+        if (s_music_hooks.prev) s_music_hooks.prev();
+        break;
+    case MUSIC_BTN_TOGGLE:
+        if (s_music_hooks.toggle) s_music_hooks.toggle();
+        break;
+    case MUSIC_BTN_NEXT:
+        if (s_music_hooks.next) s_music_hooks.next();
+        break;
+    case MUSIC_BTN_EXIT:
+        if (s_music_hooks.exit_page) s_music_hooks.exit_page();
+        break;
+    default:
+        break;
+    }
+}
+
+static lv_obj_t *make_music_button(lv_obj_t *parent, const char *text, int x,
+                                   int width, music_btn_t id)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, width, 44);
+    lv_obj_align(btn, LV_ALIGN_CENTER, x, 70);
+    lv_obj_set_style_radius(btn, 22, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2F36), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(btn, 0, 0);
+    lv_obj_add_event_cb(btn, music_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)id);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &ui_font_CJK16, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(lbl);
+    return lbl;
+}
+
+static lv_obj_t *create_music_screen(void)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x101418), 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *badge = lv_obj_create(scr);
+    lv_obj_set_size(badge, 88, 88);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge, lv_color_hex(0x1B2430), 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(badge, 0, 0);
+    lv_obj_set_style_pad_all(badge, 0, 0);
+    lv_obj_remove_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(badge, LV_ALIGN_TOP_MID, 0, 22);
+
+    lv_obj_t *icon = lv_label_create(badge);
+    lv_label_set_text(icon, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(icon, lv_color_hex(0x7FE0C1), 0);
+    lv_obj_center(icon);
+
+    s_music_title_lbl = lv_label_create(scr);
+    lv_obj_set_width(s_music_title_lbl, 240);
+    lv_label_set_long_mode(s_music_title_lbl, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(s_music_title_lbl, "无歌曲");
+    lv_obj_set_style_text_font(s_music_title_lbl, &ui_font_Body18, 0);
+    lv_obj_set_style_text_color(s_music_title_lbl, lv_color_hex(0x7FE0C1), 0);
+    lv_obj_align(s_music_title_lbl, LV_ALIGN_CENTER, 0, -34);
+
+    s_music_state_lbl = lv_label_create(scr);
+    lv_label_set_text(s_music_state_lbl, "未播放");
+    lv_obj_set_style_text_font(s_music_state_lbl, &ui_font_CJK16, 0);
+    lv_obj_set_style_text_color(s_music_state_lbl, lv_color_hex(0x9AA4AE), 0);
+    lv_obj_align(s_music_state_lbl, LV_ALIGN_CENTER, 0, 2);
+
+    make_music_button(scr, "上一首", -92, 76, MUSIC_BTN_PREV);
+    s_music_toggle_lbl = make_music_button(scr, "播放", 0, 76, MUSIC_BTN_TOGGLE);
+    make_music_button(scr, "下一首", 92, 76, MUSIC_BTN_NEXT);
+
+    s_music_index_lbl = lv_label_create(scr);
+    lv_label_set_text(s_music_index_lbl, "-/-");
+    lv_obj_set_style_text_font(s_music_index_lbl, &ui_font_Small16, 0);
+    lv_obj_set_style_text_color(s_music_index_lbl, lv_color_hex(0x9AA4AE), 0);
+    lv_obj_align(s_music_index_lbl, LV_ALIGN_CENTER, 0, 124);
+    return scr;
+}
+
+bool panda_ui_is_music_page(void)
+{
+    if (!s_ui_ready || s_music_screen == NULL) {
+        return false;
+    }
+    ui_lock();
+    bool on = lv_screen_active() == s_music_screen;
+    ui_unlock();
+    return on;
+}
+
+void panda_ui_set_music(const char *title, bool playing, int index, int count)
+{
+    if (!s_ui_ready || s_music_title_lbl == NULL) {
+        return;
+    }
+    char idx[24];
+    if (count > 0 && index >= 0) {
+        snprintf(idx, sizeof(idx), "%d/%d", index + 1, count);
+    } else {
+        snprintf(idx, sizeof(idx), "-/-");
+    }
+    const char *state = "未播放";
+    if (count <= 0) {
+        state = "SD 卡 Music 里没有 MP3";
+    } else if (playing) {
+        state = "播放中";
+    } else {
+        state = "已暂停";
+    }
+
+    ui_lock();
+    lv_label_set_text(s_music_title_lbl, title != NULL && title[0] ? title : "无歌曲");
+    lv_label_set_text(s_music_state_lbl, state);
+    lv_label_set_text(s_music_index_lbl, idx);
+    if (s_music_toggle_lbl != NULL) {
+        lv_label_set_text(s_music_toggle_lbl, playing ? "暂停" : "播放");
+    }
+    ui_unlock();
+}
+
+void panda_ui_set_music_hooks(void (*prev)(void), void (*toggle)(void),
+                              void (*next)(void), void (*exit_page)(void))
+{
+    s_music_hooks.prev = prev;
+    s_music_hooks.toggle = toggle;
+    s_music_hooks.next = next;
+    s_music_hooks.exit_page = exit_page;
 }
 
 static void update_status_box(void)
@@ -810,8 +1126,12 @@ static void apply_view_locked(void)
         s_last_screen = s_view.screen;
     }
     lv_obj_t *target = screen_for(s_view.screen);
-    if (target != NULL &&
-        (!screen_is_user_page(lv_screen_active()) || screen_is_urgent(s_view.screen))) {
+    /* Voice reconnects and offline states must not yank the user out of a
+     * menu page; the home screen still shows them as soon as it is loaded. */
+    bool urgent = screen_is_urgent(s_view.screen) &&
+                  s_view.screen != PANDA_STATE_SCREEN_OFFLINE &&
+                  s_view.screen != PANDA_STATE_SCREEN_RECONNECTING;
+    if (target != NULL && (!screen_is_user_page(lv_screen_active()) || urgent)) {
         show_screen(target);
     }
 
@@ -1017,6 +1337,7 @@ esp_err_t panda_ui_init(void)
     ui_lock();
     ui_init();
     create_menu_controls();
+    s_music_screen = create_music_screen();
     add_gesture_bubble(ui_home);
     add_gesture_bubble(ui_wakeup);
     add_gesture_bubble(ui_listening);
@@ -1389,10 +1710,11 @@ const char *panda_ui_menu_next(void)
     }
     lv_obj_t *const screens[] = {
         ui_quick_settings, ui_personality, ui_sleep_settings,
-        ui_system_settings, ui_system_info, ui_time_weather,
+        ui_system_settings, ui_system_info, ui_time_weather, s_music_screen,
     };
     static const char *const names[] = {
         "快捷设置", "人格设置", "睡眠设置", "系统设置", "设备信息", "时间天气",
+        "音乐播放",
     };
     const int count = (int)(sizeof(screens) / sizeof(screens[0]));
 

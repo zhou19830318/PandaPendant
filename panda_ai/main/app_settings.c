@@ -54,9 +54,31 @@ static void load_i32(nvs_handle_t h, const char *key, int *dst)
     }
 }
 
+static bool load_i32_found(nvs_handle_t h, const char *key, int *dst)
+{
+    int32_t v;
+    if (nvs_get_i32(h, key, &v) != ESP_OK) {
+        return false;
+    }
+    *dst = (int)v;
+    return true;
+}
+
+static void wifi_put_raw(int index, const char *ssid, const char *pass)
+{
+    if (index < 0 || index >= PANDA_WIFI_CRED_MAX) {
+        return;
+    }
+    memset(&s_cfg.wifi[index], 0, sizeof(s_cfg.wifi[index]));
+    snprintf(s_cfg.wifi[index].ssid, sizeof(s_cfg.wifi[index].ssid), "%s", ssid);
+    snprintf(s_cfg.wifi[index].pass, sizeof(s_cfg.wifi[index].pass), "%s",
+             pass ? pass : "");
+}
+
 esp_err_t panda_settings_init(void)
 {
     set_defaults(&s_cfg);
+    bool migrated = false;
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NS, NVS_READONLY, &h);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
@@ -66,8 +88,43 @@ esp_err_t panda_settings_init(void)
     }
     ESP_RETURN_ON_ERROR(err, TAG, "nvs open");
 
-    load_str(h, "wifi_ssid", s_cfg.wifi_ssid, sizeof(s_cfg.wifi_ssid));
-    load_str(h, "wifi_pass", s_cfg.wifi_pass, sizeof(s_cfg.wifi_pass));
+    int stored_count = 0;
+    if (load_i32_found(h, "wifi_n", &stored_count)) {
+        if (stored_count < 0) {
+            stored_count = 0;
+        }
+        if (stored_count > PANDA_WIFI_CRED_MAX) {
+            stored_count = PANDA_WIFI_CRED_MAX;
+        }
+        for (int i = 0; i < stored_count; i++) {
+            char key[8];
+            char ssid[PANDA_SSID_MAX] = {0};
+            char pass[PANDA_PASS_MAX] = {0};
+            snprintf(key, sizeof(key), "w%d", i);
+            size_t len = sizeof(ssid);
+            if (nvs_get_str(h, key, ssid, &len) != ESP_OK || !ssid[0]) {
+                continue;
+            }
+            snprintf(key, sizeof(key), "w%dp", i);
+            len = sizeof(pass);
+            if (nvs_get_str(h, key, pass, &len) != ESP_OK) {
+                pass[0] = '\0';
+            }
+            wifi_put_raw(s_cfg.wifi_count, ssid, pass);
+            s_cfg.wifi_count++;
+        }
+    } else {
+        /* One-shot migration from the legacy single-network keys. */
+        char ssid[PANDA_SSID_MAX] = {0};
+        char pass[PANDA_PASS_MAX] = {0};
+        load_str(h, "wifi_ssid", ssid, sizeof(ssid));
+        load_str(h, "wifi_pass", pass, sizeof(pass));
+        if (ssid[0]) {
+            wifi_put_raw(0, ssid, pass);
+            s_cfg.wifi_count = 1;
+            migrated = true;
+        }
+    }
     load_str(h, "api_mode", s_cfg.api_mode, sizeof(s_cfg.api_mode));
     load_str(h, "app_id", s_cfg.app_id, sizeof(s_cfg.app_id));
     load_str(h, "access_key", s_cfg.access_key, sizeof(s_cfg.access_key));
@@ -114,13 +171,21 @@ esp_err_t panda_settings_init(void)
         strcpy(s_cfg.weather_city, "北京");
     }
     s_loaded = true;
-    ESP_LOGI(TAG, "loaded: wifi='%s' api_mode=%s app_id=%s model=%s vol=%d bright=%d",
-             s_cfg.wifi_ssid[0] ? s_cfg.wifi_ssid : "(unset)", s_cfg.api_mode,
+    ESP_LOGI(TAG, "loaded: wifi=%d network(s) api_mode=%s app_id=%s model=%s vol=%d bright=%d",
+             s_cfg.wifi_count, s_cfg.api_mode,
              s_cfg.app_id[0] ? panda_settings_masked(s_cfg.app_id) : "(unset)",
              s_cfg.model, s_cfg.volume, s_cfg.brightness);
+    for (int i = 0; i < s_cfg.wifi_count; i++) {
+        ESP_LOGI(TAG, "  wifi[%d] ssid='%s' pass=%s", i, s_cfg.wifi[i].ssid,
+                 panda_settings_masked(s_cfg.wifi[i].pass));
+    }
     ESP_LOGI(TAG, "menu: pers=%d fb=%d anim=%d sleep=%ds wake=%d sleep_anim=%d dnd=%d city=%s",
              s_cfg.personality, s_cfg.feedback, s_cfg.animation, s_cfg.auto_sleep_s,
              s_cfg.wake_mode, s_cfg.sleep_anim, s_cfg.dnd, s_cfg.weather_city);
+    if (migrated) {
+        ESP_LOGI(TAG, "migrated legacy WiFi credential into the list");
+        panda_settings_save();
+    }
     return ESP_OK;
 }
 
@@ -136,8 +201,24 @@ esp_err_t panda_settings_save(void)
 
 #define PUT_STR(k, v) nvs_set_str(h, k, v)
 #define PUT_I32(k, v) nvs_set_i32(h, k, (int32_t)(v))
-    ESP_RETURN_ON_ERROR(PUT_STR("wifi_ssid", s_cfg.wifi_ssid), TAG, "wifi_ssid");
-    ESP_RETURN_ON_ERROR(PUT_STR("wifi_pass", s_cfg.wifi_pass), TAG, "wifi_pass");
+    ESP_RETURN_ON_ERROR(PUT_I32("wifi_n", s_cfg.wifi_count), TAG, "wifi_n");
+    for (int i = 0; i < s_cfg.wifi_count; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "w%d", i);
+        ESP_RETURN_ON_ERROR(PUT_STR(key, s_cfg.wifi[i].ssid), TAG, "wifi ssid");
+        snprintf(key, sizeof(key), "w%dp", i);
+        ESP_RETURN_ON_ERROR(PUT_STR(key, s_cfg.wifi[i].pass), TAG, "wifi pass");
+    }
+    /* Stale slots would resurrect old networks if the count grows again. */
+    for (int i = s_cfg.wifi_count; i < PANDA_WIFI_CRED_MAX; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "w%d", i);
+        nvs_erase_key(h, key);
+        snprintf(key, sizeof(key), "w%dp", i);
+        nvs_erase_key(h, key);
+    }
+    nvs_erase_key(h, "wifi_ssid");
+    nvs_erase_key(h, "wifi_pass");
     ESP_RETURN_ON_ERROR(PUT_STR("api_mode", s_cfg.api_mode), TAG, "api_mode");
     ESP_RETURN_ON_ERROR(PUT_STR("app_id", s_cfg.app_id), TAG, "app_id");
     ESP_RETURN_ON_ERROR(PUT_STR("access_key", s_cfg.access_key), TAG, "access_key");
@@ -186,8 +267,11 @@ const char *panda_settings_masked(const char *s)
 void panda_settings_print(bool include_secrets)
 {
     const panda_settings_t *c = &s_cfg;
-    ESP_LOGI(TAG, "wifi_ssid=%s wifi_pass=%s", c->wifi_ssid[0] ? c->wifi_ssid : "(unset)",
-             include_secrets ? c->wifi_pass : panda_settings_masked(c->wifi_pass));
+    ESP_LOGI(TAG, "wifi: %d saved network(s)", c->wifi_count);
+    for (int i = 0; i < c->wifi_count; i++) {
+        ESP_LOGI(TAG, "  [%d] ssid=%s pass=%s", i, c->wifi[i].ssid,
+                 include_secrets ? c->wifi[i].pass : panda_settings_masked(c->wifi[i].pass));
+    }
     ESP_LOGI(TAG, "api_mode=%s resource_id=%s app_key=%s", c->api_mode, c->resource_id,
              include_secrets ? c->app_key : panda_settings_masked(c->app_key));
     ESP_LOGI(TAG, "app_id=%s", include_secrets ? c->app_id : panda_settings_masked(c->app_id));
@@ -203,4 +287,66 @@ void panda_settings_print(bool include_secrets)
              c->wake_mode, c->sleep_anim, c->dnd);
     ESP_LOGI(TAG, "weather_city=%s", c->weather_city);
     ESP_LOGI(TAG, "persona=%s", c->persona);
+}
+
+int panda_settings_wifi_count(void)
+{
+    return s_cfg.wifi_count;
+}
+
+const panda_wifi_cred_t *panda_settings_wifi_at(int index)
+{
+    if (index < 0 || index >= s_cfg.wifi_count) {
+        return NULL;
+    }
+    return &s_cfg.wifi[index];
+}
+
+int panda_settings_wifi_index(const char *ssid)
+{
+    if (!ssid || !ssid[0]) {
+        return -1;
+    }
+    for (int i = 0; i < s_cfg.wifi_count; i++) {
+        if (strcmp(s_cfg.wifi[i].ssid, ssid) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+esp_err_t panda_settings_wifi_put(const char *ssid, const char *pass)
+{
+    if (!ssid || !ssid[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    int index = panda_settings_wifi_index(ssid);
+    if (index < 0) {
+        if (s_cfg.wifi_count >= PANDA_WIFI_CRED_MAX) {
+            return ESP_ERR_NO_MEM;
+        }
+        index = s_cfg.wifi_count++;
+    }
+    wifi_put_raw(index, ssid, pass);
+    return ESP_OK;
+}
+
+esp_err_t panda_settings_wifi_remove(const char *ssid)
+{
+    int index = panda_settings_wifi_index(ssid);
+    if (index < 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    for (int i = index; i + 1 < s_cfg.wifi_count; i++) {
+        s_cfg.wifi[i] = s_cfg.wifi[i + 1];
+    }
+    memset(&s_cfg.wifi[s_cfg.wifi_count - 1], 0, sizeof(s_cfg.wifi[0]));
+    s_cfg.wifi_count--;
+    return ESP_OK;
+}
+
+void panda_settings_wifi_clear(void)
+{
+    memset(s_cfg.wifi, 0, sizeof(s_cfg.wifi));
+    s_cfg.wifi_count = 0;
 }

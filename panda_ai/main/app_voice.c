@@ -48,11 +48,25 @@ static const char *TAG = "voice";
 /* No-speech guard: a PTT turn with fewer than PTT_SPEECH_FRAMES 40 ms frames
  * above PTT_SPEECH_RMS is an accidental touch. Peak alone misclassified room
  * noise (measured peaks 100-950 with the fan running); a sustained RMS is
- * what separates speech from clicks and hiss. Commit anyway (to clear the
- * server buffer), but suppress that turn's ASR/reply/TTS and answer locally. */
-#define PTT_SPEECH_RMS 150
-#define PTT_SPEECH_FRAMES 3
+ * what separates speech from clicks and hiss. 250 RMS / 320 ms keeps fan and
+ * handling noise out while still catching a normally spoken first word. */
+#define PTT_SPEECH_RMS 250
+#define PTT_SPEECH_FRAMES 8
+/* Pressing PTT pops the mic: a 150 ms tap peaked at ~9500 and looked like
+ * speech. Drop the first 120 ms of every PTT turn (stats and uplink). */
+#define PTT_POP_GUARD_US 120000
 #define NO_SPEECH_HINT "我在呢～没听到你说话，再说一次好吗？"
+/* A silent PTT turn used to show a subtitle only, which felt like a dead
+ * device. Send a text turn through the same realtime session so the server
+ * synthesizes an audible, in-character reminder. */
+#define NO_SPEECH_PROMPT \
+    "我不小心碰到你了，没来得及说话。你轻轻提醒我一下：想聊天时要按住屏幕说话哦。"
+#define SILENT_GRACE_MS 8000
+#define NO_SPEECH_PROMPT_COOLDOWN_MS 3000
+#define NO_SPEECH_PROMPT_TIMEOUT_MS 10000
+/* A response.canceled/done arriving just after the prompt was sent belongs
+ * to the canceled silence response, not to the prompt. */
+#define NO_SPEECH_PROMPT_ARM_MS 400
 /* Uplink is producer/consumer decoupled (vendor demo design): capture and
  * event handlers only enqueue, one TX task owns the ws send lock. Calling
  * esp_websocket_client_send_text() from the capture pump blocked the RX
@@ -126,6 +140,11 @@ static volatile uint32_t s_ptt_peak;
 static volatile uint32_t s_ptt_rms_max;
 static volatile uint32_t s_ptt_speech_frames;
 static int64_t s_ptt_press_us;
+/* 32-bit millisecond deadlines: callers are different tasks (app_core and
+ * the websocket event task), and a 64-bit read is not atomic on the ESP32. */
+static volatile uint32_t s_silent_until_ms;
+static volatile uint32_t s_prompt_sent_ms;
+static volatile bool s_prompt_turn;
 static volatile bool s_pump_enabled = true;
 
 /* Resampler state carried across TTS deltas; resetting it per delta added a
@@ -732,11 +751,141 @@ static void merge_text(char *dst, size_t cap, const char *delta)
     append_text(dst, cap, delta);
 }
 
-static void show_no_speech_hint(const char *why)
+static uint32_t now_ms(void)
 {
-    ESP_LOGI(TAG, "no speech (%s); answering locally", why);
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static bool within_silent_grace(void)
+{
+    return (int32_t)(s_silent_until_ms - now_ms()) > 0;
+}
+
+/* The server answers a committed silence turn with a canned apology such as
+ * “服务器开小差了，请稍后再试”. Treat that as a silent-turn artifact, not as
+ * a device failure that deserves the error screen. */
+static bool is_server_fallback_text(const char *text)
+{
+    static const char *const patterns[] = {
+        "服务器开小差", "服务开小差", "系统开小差",
+        "服务器繁忙", "系统繁忙", "服务繁忙", "请稍后再试",
+    };
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        if (strstr(text, patterns[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cancel_active_response(const char *why)
+{
+    if (!s_ws_connected) {
+        return;
+    }
+    s_cancel_pending = true;
+    s_cancel_play = true;
+    s_play_drain = false;
+    s_play_active = false;
+    s_audio_started = false;
+    resample_reset();
+    send_cancel();
+    ESP_LOGI(TAG, "response canceled (%s)", why);
+}
+
+/* A text turn on the same realtime session. The vendor demo's `say` command
+ * uses speech_text_buffer.append/commit with a speech_id; the replacement
+ * variant only intervenes in a response that is already generating, so a
+ * standalone reminder sent that way was ignored and left the UI in THINKING
+ * until the state-machine timeout painted an error screen. */
+static esp_err_t send_text_turn(const char *text)
+{
+    if (!s_ws_connected || !s_session_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    char esc[512];
+    char frame[768];
+    char speech_id[40];
+    json_escape(esc, sizeof(esc), text);
+    snprintf(speech_id, sizeof(speech_id), "panda-%08" PRIx32 "-%08" PRIx32,
+             esp_random(), esp_random());
+
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    int n = snprintf(frame, sizeof(frame),
+                     "{\"event_id\":\"event_%u\",\"type\":\"speech_text_buffer."
+                     "append\",\"speech_id\":\"%s\",\"text\":\"%s\"}",
+                     (unsigned)s_event_seq++, speech_id, esc);
+    esp_err_t err = ESP_ERR_NO_MEM;
+    if (n > 0 && (size_t)n < sizeof(frame)) {
+        err = tx_enqueue(frame, (size_t)n, true);
+    }
+    if (err == ESP_OK) {
+        n = snprintf(frame, sizeof(frame),
+                     "{\"event_id\":\"event_%u\",\"type\":\"speech_text_buffer."
+                     "commit\",\"speech_id\":\"%s\",\"text\":\"\"}",
+                     (unsigned)s_event_seq++, speech_id);
+        err = (n > 0 && (size_t)n < sizeof(frame)) ? tx_enqueue(frame, (size_t)n, true)
+                                                   : ESP_ERR_NO_MEM;
+    }
+    xSemaphoreGive(s_tx_lock);
+    return err;
+}
+
+static bool prompt_no_speech(const char *why)
+{
+    uint32_t now = now_ms();
+    if (s_prompt_turn &&
+        (int32_t)(now - s_prompt_sent_ms) > NO_SPEECH_PROMPT_TIMEOUT_MS) {
+        ESP_LOGW(TAG, "no-speech prompt timed out; re-arming");
+        s_prompt_turn = false;
+    }
+    if (s_prompt_turn) {
+        return false;
+    }
+    if ((int32_t)(now - s_prompt_sent_ms) < NO_SPEECH_PROMPT_COOLDOWN_MS) {
+        return false;
+    }
+    if (!s_ws_connected || !s_session_active) {
+        ESP_LOGI(TAG, "no-speech prompt skipped (%s)", why);
+        return false;
+    }
+    esp_err_t err = send_text_turn(NO_SPEECH_PROMPT);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "no-speech prompt failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    s_prompt_turn = true;
+    s_prompt_sent_ms = now;
+    s_silent_until_ms = now + SILENT_GRACE_MS;
+    s_no_speech_turn = false;
+    s_asr_text[0] = '\0';
+    s_asr_done = true;
+    s_reply_text[0] = '\0';
+    s_reply_started = false;
+    s_reply_done = false;
+    voice_state(PANDA_VOICE_THINKING);
+    ESP_LOGI(TAG, "no-speech prompt sent (%s)", why);
+    return true;
+}
+
+static void answer_no_speech(const char *why, bool cancel)
+{
+    s_silent_until_ms = now_ms() + SILENT_GRACE_MS;
+    if (cancel) {
+        cancel_active_response(why);
+    }
+    ESP_LOGI(TAG, "no speech (%s); local hint", why);
     app_core_on_subtitle(NO_SPEECH_HINT);
     voice_state(PANDA_VOICE_IDLE);
+    prompt_no_speech(why);
+}
+
+static void prompt_response_finished(void)
+{
+    if (s_prompt_turn &&
+        (int32_t)(now_ms() - s_prompt_sent_ms) > NO_SPEECH_PROMPT_ARM_MS) {
+        s_prompt_turn = false;
+    }
 }
 
 static void handle_json(const char *json, size_t len)
@@ -810,17 +959,20 @@ static void handle_json(const char *json, size_t len)
         s_asr_done = true;
         if (s_asr_text[0] == '\0') {
             /* Recognized nothing: an empty bubble looks broken, and any
-             * server response to silence is noise. Answer locally instead. */
+             * server response to silence is noise. Cancel whatever the
+             * server is already generating, then answer audibly instead. */
             s_no_speech_turn = true;
-            show_no_speech_hint("empty transcript");
+            answer_no_speech("empty transcript", true);
         } else {
             app_core_on_subtitle(s_asr_text);
             voice_state(PANDA_VOICE_THINKING);
             ESP_LOGI(TAG, "asr: %s", s_asr_text);
         }
     } else if (!strcmp(type, "conversation.item.input_audio_transcription.failed")) {
-        if (s_no_speech_turn) {
-            ESP_LOGI(TAG, "asr failed (muted: no-speech turn)");
+        if (s_no_speech_turn || (!s_prompt_turn && within_silent_grace())) {
+            ESP_LOGI(TAG, "asr failed on a silent turn (muted)");
+            s_no_speech_turn = true;
+            answer_no_speech("asr failed on silent turn", true);
         } else {
             ESP_LOGW(TAG, "asr failed");
             voice_state(PANDA_VOICE_ERROR);
@@ -843,6 +995,15 @@ static void handle_json(const char *json, size_t len)
             return;
         }
         const char *text = json_str(root, "text");
+        /* Silence commits make the LLM answer with a canned apology. Drop it
+         * instead of showing/spreaking a fake device failure. */
+        if (!s_prompt_turn && within_silent_grace() && is_server_fallback_text(text)) {
+            ESP_LOGW(TAG, "server fallback reply suppressed: %s", text);
+            s_no_speech_turn = true;
+            answer_no_speech("server fallback reply", true);
+            cJSON_Delete(root);
+            return;
+        }
         if (text[0]) {
             snprintf(s_reply_text, sizeof(s_reply_text), "%s", text);
         }
@@ -850,14 +1011,11 @@ static void handle_json(const char *json, size_t len)
         app_core_on_subtitle(s_reply_text);
         ESP_LOGI(TAG, "reply(%u bytes): %s", (unsigned)strlen(s_reply_text), s_reply_text);
     } else if (!strcmp(type, "response.output_audio.started")) {
-        if (s_no_speech_turn) {
-            /* The server generated speech from silence; drop it and stay on
-             * the local polite hint. */
-            s_cancel_pending = true;
-            s_cancel_play = true;
-            resample_reset();
-            send_cancel();
-            ESP_LOGI(TAG, "tts started on no-speech turn; cancel sent");
+        if (s_no_speech_turn || (!s_prompt_turn && within_silent_grace())) {
+            /* The server generated speech from silence; drop it and let the
+             * text prompt produce the audible reminder instead. */
+            s_no_speech_turn = true;
+            answer_no_speech("tts started on silent turn", true);
             cJSON_Delete(root);
             return;
         }
@@ -908,6 +1066,7 @@ static void handle_json(const char *json, size_t len)
         ESP_LOGI(TAG, "tts done deltas=%u ring=%u", (unsigned)s_audio_deltas,
                  (unsigned)ring_count());
     } else if (!strcmp(type, "response.done")) {
+        prompt_response_finished();
         s_audio_started = false;
         s_play_drain = true;
         s_cancel_pending = false;
@@ -915,6 +1074,7 @@ static void handle_json(const char *json, size_t len)
         s_reply_done = false;
         s_no_speech_turn = false;
     } else if (!strcmp(type, "response.canceled")) {
+        prompt_response_finished();
         s_cancel_play = true;
         resample_reset();
         s_play_drain = false;
@@ -927,11 +1087,23 @@ static void handle_json(const char *json, size_t len)
         cJSON *err = cJSON_GetObjectItemCaseSensitive(root, "error");
         const char *msg = err ? json_str(err, "message") : "";
         const char *code = err ? json_str(err, "code") : "";
-        if (s_no_speech_turn) {
-            /* Empty committed audio can make the server answer with an error;
+        if (s_no_speech_turn || (!s_prompt_turn && within_silent_grace())) {
+            /* Empty/silent audio can make the server answer with an error;
              * that is expected for an accidental touch, not a device fault. */
-            ESP_LOGI(TAG, "server error muted (no-speech turn): %s %s", code, msg);
-            s_no_speech_turn = false;
+            ESP_LOGI(TAG, "server error muted (silent turn): %s %s", code, msg);
+            s_no_speech_turn = true;
+            s_session_pending = false;
+            answer_no_speech("server error on silent turn", true);
+            cJSON_Delete(root);
+            return;
+        }
+        if (s_prompt_turn) {
+            /* A failure while speaking the reminder is still not worth an
+             * error screen; drop back to idle and let the next turn retry. */
+            ESP_LOGW(TAG, "no-speech prompt failed: %s %s", code, msg);
+            s_prompt_turn = false;
+            s_session_pending = false;
+            voice_state(PANDA_VOICE_IDLE);
             cJSON_Delete(root);
             return;
         }
@@ -1042,6 +1214,8 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         s_play_drain = false;
         s_play_active = false;
         s_cancel_play = true;
+        s_prompt_turn = false;
+        s_silent_until_ms = 0;
         resample_reset();
         if (s_tx_q) {
             xQueueReset(s_tx_q);
@@ -1077,6 +1251,9 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         s_play_drain = false;
         s_play_active = false;
         s_cancel_play = true;
+        s_no_speech_turn = false;
+        s_prompt_turn = false;
+        s_silent_until_ms = 0;
         resample_reset();
         if (s_tx_q) {
             xQueueReset(s_tx_q);
@@ -1126,6 +1303,16 @@ static void capture_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
+        if (s_prompt_turn &&
+            (int32_t)(now_ms() - s_prompt_sent_ms) > NO_SPEECH_PROMPT_TIMEOUT_MS) {
+            /* The audible reminder never produced a response. Drop back to
+             * idle here instead of letting the state machine turn 20 s of
+             * THINKING into a "服务开小差了" error screen. */
+            ESP_LOGW(TAG, "no-speech prompt got no reply; back to idle");
+            s_prompt_turn = false;
+            s_no_speech_turn = false;
+            voice_state(PANDA_VOICE_IDLE);
+        }
         if (s_clip_active && s_capture) {
             size_t left = s_clip_samples - s_clip_pos;
             size_t n = left < WIRE_SAMPLES ? left : WIRE_SAMPLES;
@@ -1167,6 +1354,9 @@ static void capture_task(void *arg)
             size_t read = 0;
             esp_err_t err = panda_audio_record(buf, FRAME_SAMPLES, &read);
             if (err == ESP_OK && read == FRAME_SAMPLES) {
+                if ((esp_timer_get_time() - s_ptt_press_us) < PTT_POP_GUARD_US) {
+                    continue;
+                }
                 int32_t peak = 0;
                 uint64_t sumsq = 0;
                 for (size_t i = 0; i < read; i++) {
@@ -1249,20 +1439,24 @@ esp_err_t app_voice_start(void)
         ESP_LOGW(TAG, "wifi not connected yet; websocket will retry");
     }
 
-    s_ring = heap_caps_malloc(RING_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    s_rx = heap_caps_malloc(RX_CAP, MALLOC_CAP_SPIRAM);
-    s_tx = heap_caps_malloc(TX_CAP, MALLOC_CAP_SPIRAM);
-    s_pcm24 = heap_caps_malloc(PCM24_CAP, MALLOC_CAP_SPIRAM);
-    s_pcm16 = heap_caps_malloc(PCM16_CAP, MALLOC_CAP_SPIRAM);
-    s_ring_lock = xSemaphoreCreateMutex();
-    s_tx_lock = xSemaphoreCreateMutex();
-    /* Static queue in PSRAM: 8 pending frames would otherwise cost ~8 KB of
-     * internal RAM, which the TLS handshake and LVGL also need. */
-    s_tx_q_storage = heap_caps_aligned_alloc(8, TX_QUEUE_DEPTH * sizeof(tx_frame_t),
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (s_tx_q_storage) {
-        s_tx_q = xQueueCreateStatic(TX_QUEUE_DEPTH, sizeof(tx_frame_t),
-                                    s_tx_q_storage, &s_tx_q_struct);
+    /* A failed start may be retried when WiFi comes up; allocate only once so
+     * retries do not leak PSRAM buffers or tasks. */
+    if (s_ring == NULL) {
+        s_ring = heap_caps_malloc(RING_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        s_rx = heap_caps_malloc(RX_CAP, MALLOC_CAP_SPIRAM);
+        s_tx = heap_caps_malloc(TX_CAP, MALLOC_CAP_SPIRAM);
+        s_pcm24 = heap_caps_malloc(PCM24_CAP, MALLOC_CAP_SPIRAM);
+        s_pcm16 = heap_caps_malloc(PCM16_CAP, MALLOC_CAP_SPIRAM);
+        s_ring_lock = xSemaphoreCreateMutex();
+        s_tx_lock = xSemaphoreCreateMutex();
+        /* Static queue in PSRAM: 8 pending frames would otherwise cost ~8 KB
+         * of internal RAM, which the TLS handshake and LVGL also need. */
+        s_tx_q_storage = heap_caps_aligned_alloc(8, TX_QUEUE_DEPTH * sizeof(tx_frame_t),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_tx_q_storage) {
+            s_tx_q = xQueueCreateStatic(TX_QUEUE_DEPTH, sizeof(tx_frame_t),
+                                        s_tx_q_storage, &s_tx_q_struct);
+        }
     }
     if (!s_ring || !s_rx || !s_tx || !s_pcm24 || !s_pcm16 || !s_ring_lock ||
         !s_tx_lock || !s_tx_q) {
@@ -1275,9 +1469,6 @@ esp_err_t app_voice_start(void)
     s_rx_skip = false;
     s_cancel_play = false;
     s_play_running = true;
-    xTaskCreate(play_task, "voice_play", 4096, NULL, 10, &s_play_task);
-    xTaskCreate(capture_task, "voice_cap", 4096, NULL, 9, &s_cap_task);
-    xTaskCreate(tx_task, "voice_tx", 4096, NULL, 8, &s_tx_task);
 
     snprintf(s_headers, sizeof(s_headers), "X-Api-Key: %s\r\n", cfg->api_key);
     esp_websocket_client_config_t ws_cfg = {
@@ -1308,6 +1499,18 @@ esp_err_t app_voice_start(void)
         esp_websocket_client_destroy(s_ws);
         s_ws = NULL;
         return err;
+    }
+    /* Start the audio tasks only once the 8 KB websocket stack has been
+     * granted: creating them first left too little contiguous internal RAM
+     * for the client on a fragmented boot heap. */
+    if (s_play_task == NULL) {
+        xTaskCreate(play_task, "voice_play", 4096, NULL, 10, &s_play_task);
+    }
+    if (s_cap_task == NULL) {
+        xTaskCreate(capture_task, "voice_cap", 4096, NULL, 9, &s_cap_task);
+    }
+    if (s_tx_task == NULL) {
+        xTaskCreate(tx_task, "voice_tx", 4096, NULL, 8, &s_tx_task);
     }
     ESP_LOGI(TAG, "voice client started (JSON mode, model=%s)", cfg->model);
     return ESP_OK;
@@ -1355,6 +1558,8 @@ esp_err_t app_voice_send_test_clip(void)
     s_clip_pos = 0;
     s_pending_capture = false;
     s_no_speech_turn = false;
+    s_prompt_turn = false;
+    s_silent_until_ms = 0;
     s_clip_active = true;
     s_capture = true;
     voice_state(PANDA_VOICE_LISTENING);
@@ -1369,6 +1574,8 @@ void app_voice_ptt_press(void)
     s_ptt_rms_max = 0;
     s_ptt_speech_frames = 0;
     s_no_speech_turn = false;
+    s_prompt_turn = false;
+    s_silent_until_ms = 0;
     if (!s_ws) {
         esp_err_t err = app_voice_start();
         if (err != ESP_OK) {
@@ -1424,13 +1631,12 @@ void app_voice_ptt_release(void)
     ESP_LOGI(TAG, "ptt release: held=%" PRIu32 "ms peak=%" PRIu32 " rms=%" PRIu32
              " speech_frames=%" PRIu32, held_ms, peak, rms, speech_frames);
     if (speech_frames < PTT_SPEECH_FRAMES) {
-        /* Accidental touch or silent hold: commit to clear the server buffer,
-         * then answer on-device and mute this turn's server events. */
+        /* Accidental touch or silent hold. Do NOT commit the silent audio:
+         * the server turns that into an ASR failure / “服务器开小差” reply,
+         * which is the error the user saw after an empty voice turn. Keep
+         * the turn local and ask the server for an audible reminder. */
         s_no_speech_turn = true;
-        if (s_session_active) {
-            send_commit();
-        }
-        show_no_speech_hint("no sustained speech");
+        answer_no_speech("no sustained speech", false);
         return;
     }
     if (s_session_active) {
@@ -1459,6 +1665,8 @@ esp_err_t app_voice_cancel(void)
     s_asr_done = true;
     s_reply_done = true;
     s_no_speech_turn = false;
+    s_prompt_turn = false;
+    s_silent_until_ms = 0;
     voice_state(PANDA_VOICE_IDLE);
     if (!s_ws_connected) {
         return ESP_ERR_INVALID_STATE;
@@ -1472,6 +1680,13 @@ esp_err_t app_voice_cancel(void)
 void app_voice_set_network(bool online)
 {
     if (!s_ws) {
+        /* The boot-time start can fail while the internal heap is still
+         * fragmented; retry once the network is actually up, otherwise the
+         * UI stays on the urgent offline screen forever. */
+        if (online) {
+            esp_err_t err = app_voice_start();
+            ESP_LOGI(TAG, "voice client start on network up: %s", esp_err_to_name(err));
+        }
         return;
     }
     if (online) {
@@ -1488,6 +1703,8 @@ void app_voice_set_network(bool online)
     s_play_active = false;
     s_cancel_play = true;
     s_no_speech_turn = false;
+    s_prompt_turn = false;
+    s_silent_until_ms = 0;
     resample_reset();
     voice_state(PANDA_VOICE_OFFLINE);
 }

@@ -36,6 +36,7 @@ panda_ai/                  当前固件工程（ESP-IDF v5.5）
     panda_connectivity/    WiFi STA/SoftAP、重连、SNTP
     panda_state/           设备/语音/情绪三维状态机（纯 C，无 LVGL 依赖）
     panda_ui/              SquareLine 屏幕包装层 + 生成资产 + 图片自检
+    panda_mp3/             SD 卡 Music 目录扫描与 MP3 解码播放
   partitions.csv           factory 10MB / assets 5.75MB / coredump
 tools/ui_sim/              主机状态机仿真 + 图片资源校验
 demo/                      厂商与参考 demo（只读参考，禁止提交真实密钥）
@@ -50,7 +51,9 @@ cd panda_ai
 idf.py build
 ```
 
-当前产物约 8.0MB（`0x804590`，固件版本 2.0.0），factory 分区剩余约 20%。
+当前产物约 8.20MB（`0x82db70`，固件版本 2.0.0），factory 分区剩余 18%
+（`0x1d2490`）。其中约 96KB 来自音乐页图标所需的 48px Montserrat 字体
+（`CONFIG_LV_FONT_MONTSERRAT_48=y`，固定在 `sdkconfig.defaults`）。
 
 主机侧自检（不需要设备）：
 
@@ -90,7 +93,7 @@ idf.py -p /dev/ttyACM0 flash monitor
 启动后按回车，提示符 `panda>`，输入 `help` 查看全部命令。常用：
 
 ```text
-status                          # 固件/UI/电池/堆状态
+status                          # 固件/UI/电池/堆状态；app 行含主循环 loops/max_gap/age
 ui state listening              # idle|connecting|listening|thinking|speaking|offline|error
 ui emotion happy                # neutral|happy|surprise|sad|sleepy|curious|shy|angry
 ui error asr                    # asr|llm|tts|audio|network|auth|generic|clear
@@ -118,7 +121,11 @@ wifi [status|scan|connect <ssid> [pass]|disconnect|forget|ap on|off|sync|recover
 # voice pump off 关闭对话间 50ms 静音上行（诊断用；关闭后服务端会因无音频输入关会话）
 audio test | audio status | audio tone [seconds]   # tone 连续 880Hz（诊断用）
 rgb <r> <g> <b> | rgb off
-i2c | sdcard status|mount|unmount | rtc [write <epoch>]
+i2c | sdcard status|ls [path]|mount|unmount | rtc [write <epoch>]
+mp3 status|list|play [index]|toggle|next|prev|stop   # SD 卡 Music 目录播放
+# mp3 status 额外输出 audio_rate/underruns/buffered/flags；稳定播放应 underruns=0、
+# buffered≈32768、flags=0x1（曲中）/0x5（曲尾），flags bit2 表示写入端已排空
+# sdcard ls 输出 "FILE <字节数> <文件名>"，可用于核对网页上传是否完整
 heap | reboot
 ```
 
@@ -131,9 +138,9 @@ heap | reboot
 |---|---|---|
 | BOOT (GPIO0) | 长按 4s | 进入/退出配网模式（开启 SoftAP + 配网页，再按 4s 关闭）；短按提示 |
 | 触摸屏 | 长按 600ms | 按住说话（PTT），松开提交；BOOT 不再触发 PTT |
-| KEY1 (TCA9555 P1.1) | 短按 | 音量 −10%（保存 NVS，播放中立即生效） |
-| KEY2 (TCA9555 P1.2) | 短按 | 音量 +10% |
-| KEY3 (TCA9555 P1.3) | 短按 | 切换菜单：快捷设置→个性化→睡眠设置→系统设置→存储与版本→时间天气 循环 |
+| KEY1 (TCA9555 P1.1) | 短按 / 按住 | 音量 −10%（按下即生效，按住每 250ms 重复；MP3 播放中同样立即生效；保存 NVS） |
+| KEY2 (TCA9555 P1.2) | 短按 / 按住 | 音量 +10%（同上） |
+| KEY3 (TCA9555 P1.3) | 短按 | 切换菜单：快捷设置→人格设置→睡眠设置→系统设置→设备信息→时间天气→音乐播放 循环 |
 | KEY3 | 长按 600ms | 返回主屏（退出菜单） |
 
 KEY1–3 经 TCA9555 轮询（20ms），只有 BOOT 能作为深睡唤醒源。
@@ -141,7 +148,7 @@ KEY1–3 经 TCA9555 轮询（20ms），只有 BOOT 能作为深睡唤醒源。
 
 ## 菜单功能
 
-KEY3 打开的六个页面均可触摸操作，选择会写入 NVS；除人格提示词在下一轮对话生效外，
+KEY3 打开的七个页面均可触摸操作，选择会写入 NVS；除人格提示词在下一轮对话生效外，
 其余设置立即应用：
 
 | 页面 | 行为 |
@@ -152,10 +159,29 @@ KEY3 打开的六个页面均可触摸操作，选择会写入 NVS；除人格�
 | 系统设置 | 真实亮度/音量滑块（拖动预览，松手保存）；百分比、Wi-Fi、时间同步状态周期刷新 |
 | 存储与版本 | 真实 SD 总容量/剩余空间与固件版本 `v2.0.0` |
 | 时间天气 | 时钟/日期随 RTC/SNTP 更新；天气来自 Open-Meteo，城市可在配网页或 `weather set` 修改 |
+| 音乐播放 | 顶部为圆形音乐图标徽章（48px 音符）；扫描 SD 卡 `Music` 目录，显示歌曲名/序号与播放状态；上一首、暂停/播放、下一首、退出。退出页面即停止播放并释放解码音频资源，恢复 16kHz 语音时钟。播放使用约 0.35s 预缓冲与 10ms 淡入淡出，切换采样率只在每首开始时静音进行一次 |
 
 自动休眠默认 300s：设备未睡、语音空闲且 5 分钟无触摸/按键/语音事件时进入睡眠；
 触摸或按键唤醒并显示 1.2s 唤醒屏（唤醒的那次输入不会同时触发原动作）。
 天气成功时 30 分钟刷新，失败 60 秒重试，离线每 10 秒检查网络；图标只有晴/多云/阴三类。
+
+## 配网页、WiFi 与音乐上传
+
+配网页与设备共用同一个 HTTP 服务（端口 80）：平时只在 SoftAP 开启时运行，
+STA 在线时要进页面可 `wifi ap on` 或长按 BOOT 4s；用完后 `wifi ap off` 关闭。
+
+- **多个 WiFi**：页面列出全部已保存网络（最多 4 个），可删除或新增；
+  新增时点“扫描附近 WiFi”从列表选择。设备启动/重连时扫描所有信道，
+  在已保存网络中选信号最强的接入点连接；扫描失败会沿用上次成功的凭证重试，
+  不会误进配网模式。一个都连不上（或无凭证）才开启热点。
+- **热点二维码**：热点开启时屏幕显示 `Panda-AI-XXXX` 的二维码（含密码），
+  手机扫码加入后访问 `http://192.168.4.1/`；页面顶部也会显示热点名与地址。
+- **网页上传音乐**：页面“SD 卡音乐”区列出卡上曲目，可选择 MP3 上传到
+  `/sdcard/Music`（单文件 ≤ 20MB，只接受 `.mp3`，中文文件名原样保留），
+  带上传进度，完成后自动刷新曲目列表。实测 2GB SDSC 卡约 330–370KB/s，
+  10MB 歌曲约 30 秒；播放 MP3 或频繁操作界面时会变慢。
+- 页面还可修改音量/亮度/天气城市/人设、豆包语音参数，以及删除已保存的 WiFi。
+  凭证只在 NVS 中保存，页面不回显（留空表示保持原值）。
 
 ## UI 架构
 
@@ -195,6 +221,12 @@ KEY3 打开的六个页面均可触摸操作，选择会写入 NVS；除人格�
   平时不占用射频/任务；STA 恢复后自动回退的热点会在 5s 后关闭（给在途响应留时间，
   用户手动 `wifi ap on` 的热点不会自动关）。配网页支持扫描周边 WiFi 并直接选择，
   只改密码也会触发重连。STA 在线时若要再进配网页，用 `wifi ap on`，用完 `wifi ap off`。
+- 进入配网：热点 SSID 为 `Panda-AI-XXXX`（`Panda-AI-` + MAC 末两字节），默认密码
+  `pandapanda`（`CONFIG_PANDA_WIFI_AP_PASSWORD`），手机连上后打开
+  `http://192.168.4.1/`。触发方式：无凭证开机、WiFi 20s 连不上自动回退、
+  运行时长按 BOOT 4s、或串口 `wifi ap on`。固件每秒自检 AP/HTTP 状态，
+  页面意外退出会自动重启；SoftAP 在 STA 未连接时固定信道 1，避免部分手机不支持
+  12/13 信道而打不开页面。
 - WiFi 已关闭 modem sleep，重连采用 1s→30s 指数退避；长时间掉线仍可能因路由器/信号
   原因发生，`wifi status` 的 `reason` 可辅助定位。
 - 已处理“假在线”卡死：驱动仍显示有 IP，但 ARP/TCP 全部失败且没有 disconnect 事件。
@@ -208,21 +240,40 @@ KEY3 打开的六个页面均可触摸操作，选择会写入 NVS；除人格�
   （TCP 窗口 5.7KB、WS buffer 4096）。真机 12/12 轮合成语音全链路通过、0 丢包。
 - 喇叭已接；抗爆音/抗卡死策略已烧录。内置 `voice clip` 可完整走通
   ASR→回复→TTS 播放（实测转写“你是谁呀你叫什么名字”），真人语音的听感验收待完成。
+- MP3 播放已改为“解码任务 + I2S 写入任务 + 32K 样本 PSRAM 环形缓冲”：16K 样本
+  预缓冲（44.1k 约 0.37s）、起播/续播淡入、曲尾淡出；文件采样率与语音时钟不同时，
+  只在每首开始、写入端空闲且静音时切换一次（支持 22.05/24/32/44.1/48kHz），
+  播放中不再重配 codec。实测 44.1k 与 48k 曲目 `underruns=0`，用户确认无卡顿/爆音。
+  曲目如有损坏或截断（SD 上残留的 `64k.mp3`/`test1m.mp3` 测试文件），播到末尾会
+  自动跳下一首，可在配网页删除。
+- 语音连接被服务端以 `403` 拒绝时（日志 `Sec-WebSocket-Accept not found`、
+  `handshake_status_code=403`），界面保持离线。除了 Key 失效/轮换，
+  **账号欠费**也会以 `45000030 resource not granted` 的形式返回 403；
+  已在 2026-11-11 实测：充值后同一 Key 立即恢复（`101 Switching Protocols`）。
+- 误触/静音长按：PTT 按下后的 120ms 爆音会被丢弃，且需累计约 320ms 有效语音才
+  提交回合，因此轻触仍按误触处理。设备会显示“我在呢～没听到你说话，再说一次好吗？”
+  并通过 `speech_text_buffer.append/commit` 请求服务端合成语音提醒；
+  连续误触有 3s 冷却，静默期间的服务端兜底文本/错误/TTS 一律抑制。
+  提示若 10s 无响应会自动回到待机，不会出现“服务器开小差”错误屏。
 - 电池电量：固件已按原理图使用 GPIO1/ADC1_CH0、分压 ×3，并带接线自检；
   但本板 `R53(1-3)` / `R78(1-2)` 两个 0R 选择跳线默认未焊，GPIO1 悬空，
   `status`/`battery` 显示 `unknown`。补焊后即可读数；注意插 USB 时
   `BAT_OUT` 约 5 V，会显示 100%，拔掉 USB 才是真实电池电压。
   补焊后 GPIO1 不能再作摄像头 HREF。配置项为 `CONFIG_PANDA_BATTERY_ADC=y`。
-- KEY1–3 的音量/菜单映射已接入并编译通过，但尚未在真机上确认按键物理顺序；
-  可先用 `key 1|2|3 [long]` 做串口预演。
-- 菜单功能（滑块、Wi-Fi 开关、勿扰静音、自动休眠/唤醒、个性化持久化、SD/版本、天气）
-  已编译通过并通过主机检查，但屏幕/触摸未接，实际布局、点击区与交互尚未真机验证。
+- KEY3 七个菜单页已在真机逐页确认，`key 3` 连按可依次到达“音乐播放”；
+  KEY1/2 音量键仍建议用 `key 1|2|3 [long]` 做串口预演确认物理顺序。
+- 菜单功能（滑块、Wi-Fi 开关、勿扰静音、自动休眠/唤醒、个性化持久化、SD/版本、天气、
+  音乐播放）已在真机操作；屏幕/触摸/喇叭均已连接。
 - 语音唤醒未实现：睡眠设置里的“语音唤醒”只会提示暂不支持，触摸/按键仍可唤醒。
 - 固件未链接蓝牙协议栈，快捷设置的蓝牙入口已隐藏；需要 BT 配网/音频需另行评估。
 - 天气使用 Open-Meteo（无需 Key），需要联网；只有晴/多云/阴三种图标，尚未取到数据时显示 `--`，
   取数失败保留上一次结果。
 - 自动休眠只是 UI 睡眠，Wi-Fi 与语音连接仍在线，不做深睡省电。
 - O2.0 控制台权限/模型版本待确认；JSON 链路已用现有 api_key 跑通。
-- 内部 RAM 启动后约 19KB 稳定（对齐 demo 的 WiFi 缓冲后比早期 ~31KB 更低，
-  TLS 峰值最低约 10KB），音频/JSON/环形缓冲/天气缓冲必须放 PSRAM；
-  天气 HTTPS 与语音 WS 并发时内部堆偏低会跳过本轮刷新（日志 `fetch skipped`）。
+- 内部 RAM 启动后约 118KB（`internal=118315`，最大块 63KB；上传时约 94–103KB）。
+  LVGL 的 96KB widget 池与 MP3 曲目表已移到 PSRAM（`LV_MEM_POOL_ALLOC`），
+  音频/JSON/环形缓冲仍必须放 PSRAM；天气 HTTPS 与语音 WS 并发时若内部堆不足
+  会跳过本轮刷新（日志 `fetch skipped`）。
+- SD 卡为 2GB SDSC（`SA02G`，1-bit/20MHz，实测写约 330–370KB/s）。上传大文件时
+  不要把卡拔出；写到一半复位会留下 0 字节文件（目录项已创建、数据未落盘），
+  可用 `sdcard ls` 核对字节数并重新上传。20MB 单文件上限由 `/upload/music` 强制执行。

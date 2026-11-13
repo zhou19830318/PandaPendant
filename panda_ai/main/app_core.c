@@ -5,6 +5,7 @@
 #include "panda_board.h"
 #include "panda_connectivity.h"
 #include "panda_display.h"
+#include "panda_mp3.h"
 #include "panda_ui.h"
 
 #include <stdio.h>
@@ -59,6 +60,7 @@ static bool s_wifi_connecting = true;
 static bool s_low_batt_warned;
 
 #define KEY_VOLUME_STEP 10
+#define KEY_VOLUME_REPEAT_US (250LL * 1000)
 /* BOOT is the only runtime key wired to provisioning; PTT is touch-only. */
 #define BOOT_PROVISION_HOLD_US (4LL * 1000 * 1000)
 
@@ -66,6 +68,15 @@ static bool s_btn_last[4];
 static int64_t s_btn_down_us[4];
 static bool s_btn_long[4];
 static bool s_btn_wake[4];
+static bool s_btn_vol_fired[4];
+static int64_t s_btn_repeat_us[4];
+
+/* Loop liveness: a busy UI/mp3 lock must not make the keys feel dead, and
+ * when it does we need the stage name in the log. */
+static volatile uint32_t s_loop_seq;
+static volatile uint32_t s_loop_max_gap_ms;
+static volatile int64_t s_loop_us;
+static const char *volatile s_loop_stage = "idle";
 static bool s_touch_last;
 static bool s_touch_wake;
 static int64_t s_touch_down_us;
@@ -74,6 +85,7 @@ static uint16_t s_touch_start_y;
 static bool s_touch_moved;
 static int s_ptt_source; /* 0 none, 2 touch */
 static int64_t s_last_active_us;
+static bool s_music_page_on;
 
 static void touch_activity(void)
 {
@@ -123,6 +135,9 @@ static void ptt_release(int source)
     app_voice_ptt_release();
 }
 
+static bool s_vol_dirty;
+static int64_t s_vol_dirty_us;
+
 static void volume_step(int delta)
 {
     panda_settings_t *cfg = panda_settings_get();
@@ -138,12 +153,21 @@ static void volume_step(int delta)
         panda_ui_toast(buf, 600);
         return;
     }
+    /* Apply to the codec first: an NVS commit or a busy display lock must not
+     * make the key feel dead. Persist from the 1 Hz loop instead of the key
+     * path (holding a key used to trigger a flash write per step). */
     cfg->volume = pct;
-    panda_settings_save();
-    panda_audio_set_volume(pct);
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t aerr = panda_audio_set_volume(pct);
+    int64_t t1 = esp_timer_get_time();
     panda_ui_set_volume(pct, pct == 0);
     panda_ui_toast(buf, 800);
-    ESP_LOGI(TAG, "key volume=%d%%", pct);
+    int64_t t2 = esp_timer_get_time();
+    s_vol_dirty = true;
+    s_vol_dirty_us = t2;
+    ESP_LOGI(TAG, "key volume=%d%% (audio %lld ms %s, ui %lld ms)", pct,
+             (long long)((t1 - t0) / 1000), esp_err_to_name(aerr),
+             (long long)((t2 - t1) / 1000));
 }
 
 static void menu_volume_hook(int percent, bool commit)
@@ -209,16 +233,16 @@ static void menu_sleep_now_hook(void)
 
 static void menu_wifi_hook(bool enable)
 {
-    panda_settings_t *cfg = panda_settings_get();
     if (!enable) {
         panda_connectivity_ap(false);
         panda_connectivity_disconnect();
         ESP_LOGI(TAG, "menu wifi off");
         return;
     }
-    if (cfg->wifi_ssid[0]) {
-        panda_connectivity_connect(cfg->wifi_ssid, cfg->wifi_pass);
-        ESP_LOGI(TAG, "menu wifi connect '%s'", cfg->wifi_ssid);
+    if (panda_settings_wifi_count() > 0) {
+        panda_connectivity_set_credentials(panda_settings_get()->wifi,
+                                           panda_settings_wifi_count());
+        ESP_LOGI(TAG, "menu wifi connect (%d saved)", panda_settings_wifi_count());
     } else {
         panda_connectivity_ap(true);
         panda_ui_toast("无 WiFi 凭证，已开启配网", 1600);
@@ -233,6 +257,99 @@ static void menu_dnd_hook(bool enable)
     panda_audio_mute(enable);
     panda_settings_save();
     ESP_LOGI(TAG, "menu dnd=%d", enable);
+}
+
+static void music_prev_hook(void)
+{
+    panda_mp3_prev();
+}
+
+static void music_toggle_hook(void)
+{
+    panda_mp3_toggle();
+}
+
+static void music_next_hook(void)
+{
+    panda_mp3_next();
+}
+
+static void music_exit_hook(void)
+{
+    panda_ui_menu_home();
+}
+
+static int s_music_shown_idx = -2;
+static int s_music_shown_count = -1;
+static bool s_music_shown_play;
+static char s_music_shown_title[96];
+
+static void music_page_refresh(void)
+{
+    int idx = panda_mp3_current();
+    int count = panda_mp3_count();
+    const char *title = panda_mp3_current_title();
+    if (title[0] == '\0' && count > 0) {
+        title = panda_mp3_title(idx >= 0 ? idx : 0);
+    }
+    bool playing = panda_mp3_state() == PANDA_MP3_PLAYING;
+    if (idx == s_music_shown_idx && count == s_music_shown_count &&
+        playing == s_music_shown_play &&
+        strcmp(title, s_music_shown_title) == 0) {
+        return;
+    }
+    s_music_shown_idx = idx;
+    s_music_shown_count = count;
+    s_music_shown_play = playing;
+    snprintf(s_music_shown_title, sizeof(s_music_shown_title), "%s", title);
+    panda_ui_set_music(title, playing, idx, count);
+}
+
+static void music_page_sync(void)
+{
+    bool on = panda_ui_is_music_page();
+    if (on && !s_music_page_on) {
+        if (app_voice_is_active()) {
+            app_voice_cancel();
+        }
+        int count = panda_mp3_scan();
+        ESP_LOGI(TAG, "music page entered (%d track(s) in %s)", count, panda_mp3_dir());
+        if (count <= 0) {
+            panda_ui_set_music("无歌曲", false, -1, 0);
+            panda_ui_toast("SD 卡 Music 文件夹没有 MP3", 2000);
+        } else {
+            esp_err_t err = panda_mp3_play(-1);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "mp3 play failed: %s", esp_err_to_name(err));
+                panda_ui_toast("MP3 播放失败", 1600);
+            }
+        }
+        s_music_shown_idx = -2;
+    } else if (!on && s_music_page_on) {
+        panda_mp3_stop();
+        ESP_LOGI(TAG, "music page left, playback stopped and resources released");
+        s_music_shown_idx = -2;
+    }
+    s_music_page_on = on;
+    if (on) {
+        music_page_refresh();
+    }
+}
+
+static void provisioning_qr_sync(void)
+{
+#if CONFIG_PANDA_PROVISIONING
+    bool want = panda_connectivity_is_ap() && !panda_connectivity_is_connected();
+    if (want && !panda_ui_provisioning_qr_visible()) {
+        const char *ssid = panda_connectivity_ap_ssid();
+        panda_ui_show_provisioning_qr(ssid, CONFIG_PANDA_WIFI_AP_PASSWORD,
+                                      "http://192.168.4.1");
+        ESP_LOGI(TAG, "provisioning QR shown (ssid=%s)", ssid);
+    } else if (!want && panda_ui_provisioning_qr_visible()) {
+        panda_ui_hide_provisioning_qr();
+        ESP_LOGI(TAG, "provisioning QR hidden");
+    }
+#endif
 }
 
 static bool read_sd_usage(uint64_t *free_kb, uint64_t *total_kb)
@@ -384,6 +501,8 @@ static void app_core_task(void *arg)
     int64_t next_batt = 0;
     int64_t next_heap = 0;
     int64_t next_sync = 0;
+    int64_t next_prov = 0;
+    int64_t next_music = 0;
 
     app_core_set_wifi_status(false, false, true);
     panda_ui_set_voice_state(PANDA_VOICE_CONNECTING);
@@ -394,31 +513,67 @@ static void app_core_task(void *arg)
     app_voice_start();
 
     while (true) {
+        int64_t t_loop = esp_timer_get_time();
+        if (s_loop_us != 0) {
+            uint32_t gap_ms = (uint32_t)((t_loop - s_loop_us) / 1000);
+            if (gap_ms > s_loop_max_gap_ms) {
+                s_loop_max_gap_ms = gap_ms;
+            }
+            if (gap_ms > 200) {
+                ESP_LOGW(TAG, "loop stall %u ms in %s", (unsigned)gap_ms,
+                         (const char *)s_loop_stage);
+            }
+        }
+        s_loop_us = t_loop;
+        s_loop_seq++;
+
+        s_loop_stage = "keys";
         panda_board_buttons_scan();
         int64_t now = esp_timer_get_time();
 
         for (int i = 0; i < 4; i++) {
             bool pressed = panda_board_button_pressed((panda_button_t)i);
+            bool vol_key = (i == PANDA_BTN_1 || i == PANDA_BTN_2);
             if (pressed && !s_btn_last[i]) {
                 s_btn_down_us[i] = now;
                 s_btn_long[i] = false;
+                s_btn_repeat_us[i] = now;
                 s_btn_wake[i] = wake_if_sleeping();
+                s_btn_vol_fired[i] = false;
                 touch_activity();
                 ESP_LOGI(TAG, "button %d down", i);
+                /* Volume keys react on press: waiting for the release added a
+                 * 600 ms dead zone and made a held key do nothing at all. */
+                if (vol_key && !s_btn_wake[i]) {
+                    s_btn_vol_fired[i] = true;
+                    app_core_key_action(i, false);
+                }
             } else if (pressed && !s_btn_long[i] &&
                        (now - s_btn_down_us[i]) > (i == PANDA_BTN_BOOT ? BOOT_PROVISION_HOLD_US : 600000)) {
                 s_btn_long[i] = true;
+                s_btn_repeat_us[i] = now;
                 ESP_LOGI(TAG, "button %d long", i);
                 /* BOOT still works after waking the screen: the 4 s hold is deliberate. */
-                if (!s_btn_wake[i] || i == PANDA_BTN_BOOT) {
+                if (vol_key) {
+                    if (!s_btn_wake[i]) {
+                        app_core_key_action(i, false);
+                    }
+                } else if (!s_btn_wake[i] || i == PANDA_BTN_BOOT) {
                     app_core_key_action(i, true);
+                }
+            } else if (pressed && s_btn_long[i] && vol_key &&
+                       (now - s_btn_repeat_us[i]) >= KEY_VOLUME_REPEAT_US) {
+                s_btn_repeat_us[i] = now;
+                if (!s_btn_wake[i]) {
+                    app_core_key_action(i, false);
                 }
             } else if (!pressed && s_btn_last[i]) {
                 ESP_LOGI(TAG, "button %d up (%s)", i, s_btn_long[i] ? "long" : "short");
-                if (!s_btn_long[i] && !s_btn_wake[i]) {
+                if (!s_btn_long[i] && !s_btn_wake[i] && !s_btn_vol_fired[i]) {
                     app_core_key_action(i, false);
                 }
                 s_btn_wake[i] = false;
+                s_btn_vol_fired[i] = false;
             }
             s_btn_last[i] = pressed;
         }
@@ -440,6 +595,7 @@ static void app_core_task(void *arg)
                 s_touch_moved = true;
             }
             if (!s_touch_moved && !s_ptt_source && !s_touch_wake &&
+                !panda_ui_is_music_page() &&
                 (now - s_touch_down_us) > 600000) {
                 ptt_press(2);
             }
@@ -450,6 +606,7 @@ static void app_core_task(void *arg)
         s_touch_last = ts->pressed;
 
         app_event_t ev;
+        s_loop_stage = "events";
         if (xQueueReceive(s_queue, &ev, pdMS_TO_TICKS(20)) == pdPASS) {
             if (ev.type == EVT_TOUCH) {
                 handle_touch(ev.u.touch.gesture, ev.u.touch.x, ev.u.touch.y);
@@ -464,9 +621,15 @@ static void app_core_task(void *arg)
                 if (s_wifi_ap != was_ap) {
                     if (s_wifi_ap) {
                         ESP_LOGI(TAG, "provisioning page enabled (SoftAP on)");
-                        app_provisioning_start();
-                    } else {
-                        ESP_LOGI(TAG, "provisioning page disabled (SoftAP off)");
+                        panda_ui_toast("配网热点已开启", 2000);
+                        if (app_provisioning_start() == ESP_OK) {
+                            ESP_LOGI(TAG, "provisioning ready: ssid=%s ip=%s",
+                                     panda_connectivity_ap_ssid(),
+                                     panda_connectivity_ap_ip()[0] ?
+                                     panda_connectivity_ap_ip() : "192.168.4.1");
+                        }
+                    } else if (!s_wifi_connected) {
+                        ESP_LOGI(TAG, "provisioning page disabled (no AP, no STA)");
                         app_provisioning_stop();
                     }
                 }
@@ -474,10 +637,18 @@ static void app_core_task(void *arg)
                 if (was_connected != s_wifi_connected) {
                     app_voice_set_network(s_wifi_connected);
                 }
+                provisioning_qr_sync();
             }
         }
 
+        if (now >= next_music) {
+            s_loop_stage = "music";
+            next_music = now + 300000;
+            music_page_sync();
+        }
+
         if (s_ui_pending_lock) {
+            s_loop_stage = "voice-ui";
             bool have_voice = false;
             bool have_subtitle = false;
             panda_voice_ui_t pending_voice = PANDA_VOICE_IDLE;
@@ -503,6 +674,7 @@ static void app_core_task(void *arg)
         }
 
         if (now >= next_time) {
+            s_loop_stage = "1hz";
             next_time = now + 1000000;
             struct tm tm_now;
             time_t sys = time(NULL);
@@ -522,6 +694,16 @@ static void app_core_task(void *arg)
                 panda_ui_set_time(0, 0, 0, 0, 0, 0, false);
             }
 
+            if (s_vol_dirty && (now - s_vol_dirty_us) >= 1000000) {
+                s_vol_dirty = false;
+                int64_t t0 = esp_timer_get_time();
+                panda_settings_save();
+                int64_t dt = esp_timer_get_time() - t0;
+                if (dt > 50000) {
+                    ESP_LOGW(TAG, "volume persist took %lld ms", (long long)(dt / 1000));
+                }
+            }
+
             const panda_settings_t *cfg = panda_settings_get();
             panda_voice_ui_t voice = panda_ui_get_voice_state();
             bool voice_idle = voice == PANDA_VOICE_IDLE || voice == PANDA_VOICE_OFFLINE;
@@ -530,14 +712,38 @@ static void app_core_task(void *arg)
                 panda_ui_sleep();
                 ESP_LOGI(TAG, "auto sleep after %ds idle", cfg->auto_sleep_s);
             }
+
+            /* Do not rely on the AP edge event alone: it is enqueued from the
+             * WiFi task and can be missed/coalesced while the UI is busy.
+             * Reconcile once a second and retry a failed httpd start. */
+            bool ap_on = panda_connectivity_is_ap();
+            bool net_up = ap_on || s_wifi_connected;
+            bool page_on = app_provisioning_is_running();
+            if (net_up && !page_on && now >= next_prov) {
+                /* A deferred start (internal heap too fragmented) leaves no
+                 * side effects, so retry quickly to catch a free window. */
+                next_prov = now + 2000000;
+                ESP_LOGW(TAG, "network is up but provisioning page is down; restarting");
+                if (app_provisioning_start() == ESP_OK) {
+                    ESP_LOGI(TAG, "provisioning ready: http://%s/",
+                             ap_on && panda_connectivity_ap_ip()[0] ?
+                             panda_connectivity_ap_ip() : panda_connectivity_ip());
+                }
+            } else if (!net_up && page_on) {
+                ESP_LOGI(TAG, "no network; stopping provisioning page");
+                app_provisioning_stop();
+            }
+            provisioning_qr_sync();
         }
 
         if (now >= next_sync) {
+            s_loop_stage = "menu-sync";
             next_sync = now + 60000000;
             sync_menu_state();
         }
 
         if (now >= next_batt) {
+            s_loop_stage = "battery";
             next_batt = now + 5000000;
             bool present = panda_board_get_info()->battery_adc_ok;
             uint32_t mv = panda_board_battery_mv();
@@ -571,6 +777,20 @@ static void app_core_task(void *arg)
     }
 }
 
+void app_core_loop_stats(uint32_t *loops, uint32_t *max_gap_ms, uint32_t *age_ms)
+{
+    if (loops) {
+        *loops = s_loop_seq;
+    }
+    if (max_gap_ms) {
+        *max_gap_ms = s_loop_max_gap_ms;
+    }
+    if (age_ms) {
+        int64_t t = esp_timer_get_time();
+        *age_ms = s_loop_us == 0 ? 0 : (uint32_t)((t - s_loop_us) / 1000);
+    }
+}
+
 esp_err_t app_core_start(void)
 {
     s_queue = xQueueCreate(12, sizeof(app_event_t));
@@ -588,6 +808,9 @@ esp_err_t app_core_start(void)
         .dnd = menu_dnd_hook,
     };
     panda_ui_set_menu_hooks(&hooks);
+    panda_ui_set_music_hooks(music_prev_hook, music_toggle_hook,
+                             music_next_hook, music_exit_hook);
+    panda_mp3_init();
     BaseType_t ok = xTaskCreatePinnedToCore(app_core_task, "app_core", 6 * 1024, NULL, 5, NULL, 1);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }

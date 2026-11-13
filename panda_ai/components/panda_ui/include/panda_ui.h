@@ -120,6 +120,19 @@ bool panda_ui_is_home_screen(void);
 const char *panda_ui_menu_next(void);
 void panda_ui_menu_home(void);
 
+/* Provisioning QR overlay: joins the SoftAP in one scan. */
+void panda_ui_show_provisioning_qr(const char *ap_ssid, const char *ap_pass, const char *url);
+void panda_ui_hide_provisioning_qr(void);
+bool panda_ui_provisioning_qr_visible(void);
+
+/* True while the active LVGL screen is the MP3 player page. */
+bool panda_ui_is_music_page(void);
+/* Music page content: title plus playback state. */
+void panda_ui_set_music(const char *title, bool playing, int index, int count);
+/* Registers the touch controls on the music page (prev/play/next/exit). */
+void panda_ui_set_music_hooks(void (*prev)(void), void (*toggle)(void),
+                              void (*next)(void), void (*exit_page)(void));
+
 void panda_ui_set_status(const char *status);
 void panda_ui_set_subtitle(const char *text);
 

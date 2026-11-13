@@ -32,9 +32,16 @@ static esp_codec_dev_handle_t s_in;
  * TTS playback and produce audible gaps. */
 static SemaphoreHandle_t s_tx_lock;
 static SemaphoreHandle_t s_rx_lock;
+/* Codec register access (volume, mute, readback) has its own lock. The mp3
+ * writer holds s_tx_lock almost continuously and outranks app_core, so a
+ * volume change waited seconds for it and the volume key looked dead. The
+ * DAC volume register is independent of the I2S data path. */
+static SemaphoreHandle_t s_ctl_lock;
+#define CTL_LOCK_TIMEOUT_MS 200
 static int s_volume = DEFAULT_VOLUME;
 static bool s_ready;
 static bool s_has_mic;
+static uint32_t s_rate = PANDA_AUDIO_RATE;
 
 static esp_err_t i2s_init(void)
 {
@@ -172,11 +179,11 @@ static esp_err_t codecs_open(void)
         .bits_per_sample = PANDA_AUDIO_BITS,
         .channel = 1,
         .channel_mask = 0,
-        .sample_rate = PANDA_AUDIO_RATE,
+        .sample_rate = s_rate,
     };
 
     if (esp_codec_dev_open(s_out, &fs) != 0) {
-        ESP_LOGE(TAG, "speaker open failed");
+        ESP_LOGE(TAG, "speaker open failed at %u Hz", (unsigned)s_rate);
         return ESP_FAIL;
     }
     esp_codec_dev_set_out_vol(s_out, s_volume);
@@ -185,8 +192,10 @@ static esp_err_t codecs_open(void)
     if (s_in != NULL) {
         fs.channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0);
         if (esp_codec_dev_open(s_in, &fs) != 0) {
-            ESP_LOGW(TAG, "microphone open failed");
-            s_in = NULL;
+            /* Keep the handle: a rate switch (44.1/48 k) may reject the ADC
+             * while the speaker is fine, and we want mic back at 16 kHz. */
+            ESP_LOGW(TAG, "microphone open failed at %u Hz", (unsigned)s_rate);
+            s_has_mic = false;
         } else {
             esp_codec_dev_set_in_gain(s_in, MIC_GAIN_DB);
             s_has_mic = true;
@@ -203,7 +212,8 @@ esp_err_t panda_audio_init(void)
 
     s_tx_lock = xSemaphoreCreateMutex();
     s_rx_lock = xSemaphoreCreateMutex();
-    if (s_tx_lock == NULL || s_rx_lock == NULL) {
+    s_ctl_lock = xSemaphoreCreateMutex();
+    if (s_tx_lock == NULL || s_rx_lock == NULL || s_ctl_lock == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -233,7 +243,9 @@ esp_err_t panda_audio_init(void)
 
     xSemaphoreTake(s_tx_lock, portMAX_DELAY);
     xSemaphoreTake(s_rx_lock, portMAX_DELAY);
+    xSemaphoreTake(s_ctl_lock, portMAX_DELAY);
     err = codecs_open();
+    xSemaphoreGive(s_ctl_lock);
     xSemaphoreGive(s_rx_lock);
     xSemaphoreGive(s_tx_lock);
     if (err != ESP_OK) {
@@ -241,9 +253,78 @@ esp_err_t panda_audio_init(void)
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "audio ready (16kHz mono, mic=%s, volume=%d%%)",
-             s_has_mic ? "yes" : "no", s_volume);
+    ESP_LOGI(TAG, "audio ready (%u Hz mono, mic=%s, volume=%d%%)",
+             (unsigned)s_rate, s_has_mic ? "yes" : "no", s_volume);
     return ESP_OK;
+}
+
+esp_err_t panda_audio_set_rate(uint32_t sample_rate)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    switch (sample_rate) {
+    case PANDA_AUDIO_RATE:
+    case 22050:
+    case 24000:
+    case 32000:
+    case 44100:
+    case 48000:
+        break;
+    default:
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (sample_rate == s_rate) {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    xSemaphoreTake(s_rx_lock, portMAX_DELAY);
+    xSemaphoreTake(s_ctl_lock, portMAX_DELAY);
+
+    esp_codec_dev_close(s_out);
+    if (s_in != NULL && s_has_mic) {
+        esp_codec_dev_close(s_in);
+    }
+    s_has_mic = false;
+
+    i2s_channel_disable(s_tx);
+    i2s_channel_disable(s_rx);
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate);
+    esp_err_t err = i2s_channel_reconfig_std_clock(s_rx, &clk_cfg);
+    if (err == ESP_OK) {
+        err = i2s_channel_reconfig_std_clock(s_tx, &clk_cfg);
+    }
+    i2s_channel_enable(s_rx);
+    i2s_channel_enable(s_tx);
+
+    if (err == ESP_OK) {
+        uint32_t prev = s_rate;
+        s_rate = sample_rate;
+        err = codecs_open();
+        if (err != ESP_OK) {
+            s_rate = prev;
+        }
+    }
+
+    xSemaphoreGive(s_ctl_lock);
+    xSemaphoreGive(s_rx_lock);
+    xSemaphoreGive(s_tx_lock);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "audio rate -> %u Hz (mic=%s)", (unsigned)sample_rate,
+                 s_has_mic ? "yes" : "no");
+        vTaskDelay(pdMS_TO_TICKS(10));
+    } else {
+        ESP_LOGE(TAG, "audio rate switch to %u Hz failed: %s",
+                 (unsigned)sample_rate, esp_err_to_name(err));
+    }
+    return err;
+}
+
+uint32_t panda_audio_get_rate(void)
+{
+    return s_rate;
 }
 
 bool panda_audio_ready(void)
@@ -261,7 +342,7 @@ esp_err_t panda_audio_record(int16_t *buffer, size_t samples, size_t *samples_re
     if (samples_read) {
         *samples_read = 0;
     }
-    if (!s_ready || s_in == NULL || buffer == NULL || samples == 0) {
+    if (!s_ready || s_in == NULL || !s_has_mic || buffer == NULL || samples == 0) {
         return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(s_rx_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -312,9 +393,13 @@ esp_err_t panda_audio_set_volume(int percent)
     if (!s_ready || s_out == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    if (xSemaphoreTake(s_ctl_lock, pdMS_TO_TICKS(CTL_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        /* A rate switch owns the codec right now; it re-applies s_volume
+         * when it reopens, so skipping this write loses nothing. */
+        return ESP_ERR_TIMEOUT;
+    }
     int ret = esp_codec_dev_set_out_vol(s_out, percent);
-    xSemaphoreGive(s_tx_lock);
+    xSemaphoreGive(s_ctl_lock);
     return ret == 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -323,9 +408,11 @@ esp_err_t panda_audio_get_volume(int *percent)
     if (percent == NULL || !s_ready || s_out == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    if (xSemaphoreTake(s_ctl_lock, pdMS_TO_TICKS(CTL_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     int ret = esp_codec_dev_get_out_vol(s_out, percent);
-    xSemaphoreGive(s_tx_lock);
+    xSemaphoreGive(s_ctl_lock);
     return ret == 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -334,9 +421,24 @@ esp_err_t panda_audio_mute(bool mute)
     if (!s_ready || s_out == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    if (xSemaphoreTake(s_ctl_lock, pdMS_TO_TICKS(CTL_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     int ret = esp_codec_dev_set_out_mute(s_out, mute);
-    xSemaphoreGive(s_tx_lock);
+    xSemaphoreGive(s_ctl_lock);
+    return ret == 0 ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t panda_audio_get_codec_reg(uint8_t reg, int *value)
+{
+    if (!s_ready || s_out == NULL || value == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_ctl_lock, pdMS_TO_TICKS(CTL_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    int ret = esp_codec_dev_read_reg(s_out, reg, value);
+    xSemaphoreGive(s_ctl_lock);
     return ret == 0 ? ESP_OK : ESP_FAIL;
 }
 

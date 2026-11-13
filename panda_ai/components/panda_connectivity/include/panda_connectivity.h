@@ -12,6 +12,13 @@ extern "C" {
 typedef void (*panda_connectivity_status_cb_t)(bool connected, bool ap, bool connecting);
 typedef void (*panda_connectivity_time_cb_t)(time_t epoch);
 
+#define PANDA_WIFI_CRED_MAX 4
+
+typedef struct {
+    char ssid[33];
+    char pass[65];
+} panda_wifi_cred_t;
+
 typedef struct {
     char ssid[33];
     int8_t rssi;
@@ -19,11 +26,15 @@ typedef struct {
     uint8_t authmode;
 } panda_connectivity_ap_t;
 
-esp_err_t panda_connectivity_init(const char *ssid, const char *password);
+/* Starts with up to PANDA_WIFI_CRED_MAX saved networks. The strongest saved
+ * network seen in a scan wins; when none is in range the SoftAP comes up
+ * immediately for provisioning. */
+esp_err_t panda_connectivity_init(const panda_wifi_cred_t *creds, int count);
+esp_err_t panda_connectivity_set_credentials(const panda_wifi_cred_t *creds, int count);
+esp_err_t panda_connectivity_reconnect_best(void);
 void panda_connectivity_set_callbacks(panda_connectivity_status_cb_t status_cb,
                                       panda_connectivity_time_cb_t time_cb);
 
-esp_err_t panda_connectivity_connect(const char *ssid, const char *password);
 esp_err_t panda_connectivity_disconnect(void);
 esp_err_t panda_connectivity_forget(void);
 esp_err_t panda_connectivity_scan(void);

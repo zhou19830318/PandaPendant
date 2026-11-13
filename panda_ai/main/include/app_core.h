@@ -25,6 +25,9 @@ void app_core_settings_changed(void);
 void app_core_on_voice_state(panda_voice_ui_t state);
 void app_core_on_emotion(panda_emotion_t emotion);
 void app_core_on_subtitle(const char *text);
+/* Diagnostics for the key loop: how often it ran, the worst gap between
+ * iterations and how long ago the last one started. */
+void app_core_loop_stats(uint32_t *loops, uint32_t *max_gap_ms, uint32_t *age_ms);
 
 /* Implemented by app_voice once the voice pipeline is enabled. Weak stubs
  * live in app_core so the UI milestone can build standalone. */

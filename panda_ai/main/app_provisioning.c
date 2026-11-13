@@ -3,14 +3,20 @@
 #include "app_settings.h"
 #include "app_weather.h"
 #include "panda_audio.h"
+#include "panda_board.h"
 #include "panda_connectivity.h"
 #include "panda_display.h"
+#include "panda_mp3.h"
 #include "panda_ui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <strings.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "sdkconfig.h"
 #include "esp_log.h"
@@ -18,11 +24,13 @@
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 
 static const char *TAG = "prov";
 
 #define BODY_MAX 6144
 #define MAX_SCAN_AP 20
+#define UPLOAD_MAX_BYTES (20 * 1024 * 1024)
 
 static httpd_handle_t s_server;
 
@@ -142,14 +150,25 @@ static bool form_get(char *body, const char *key, char *out, size_t out_cap)
 
 static esp_err_t send_chunk(httpd_req_t *req, const char *text)
 {
+    /* A zero-length chunk terminates the response. Empty optional fields
+     * (unset App ID, no STA IP) used to end the page mid-HTML, which made
+     * the provisioning page look broken or unreachable. */
+    if (!text || !text[0]) {
+        return ESP_OK;
+    }
     return httpd_resp_send_chunk(req, text, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t index_get(httpd_req_t *req)
 {
     panda_settings_t *cfg = panda_settings_get();
-    char esc[PANDA_PERSONA_MAX * 6 + 1];
-
+    /* The escaped persona can be 3 KB; keeping it off the 4 KB httpd task
+     * stack (which must be small enough for the fragmented internal heap). */
+    size_t esc_cap = PANDA_PERSONA_MAX * 6 + 1;
+    char *esc = heap_caps_malloc(esc_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!esc) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+    }
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
@@ -167,13 +186,16 @@ static esp_err_t index_get(httpd_req_t *req)
         "textarea{min-height:80px}button{width:100%;margin:22px 0;padding:12px;border:0;border-radius:8px;"
         "background:#111;color:#fff;font-size:16px}.row{display:flex;gap:12px}.row>div{flex:1}"
         ".scan{width:100%;margin:8px 0 0;padding:10px;background:#2b6cb0;font-size:14px}"
-        "</style></head><body><main><h1>Panda AI 配网</h1>"
-        "<p class=\"note\">连接热点 <b>");
+        ".net{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;"
+        "margin:6px 0;background:#fff;border:1px solid #ddd;border-radius:8px;font-size:15px}"
+        ".net form{margin:0}.del{width:auto;margin:0;padding:6px 12px;background:#c0392b;font-size:13px}"
+        "</style></head><body><main><h1>Panda AI 配置</h1>"
+        "<p class=\"note\">设备联网后，在同一局域网的浏览器打开本页即可上传音乐、修改设置。"
+                   "设备连不上已保存的 WiFi 时会自动开启热点 <b>");
     send_chunk(req, panda_connectivity_ap_ssid());
-    send_chunk(req, "</b> 后打开本页。密钥仅保存在设备 NVS，页面不回显；留空表示保持原值。</p>"
-                   "<p class=\"note\">平时本页关闭以节省射频资源；设备 20 秒内连不上已保存的 WiFi 时"
-                   "会自动开启热点，连上热点后访问 http://192.168.4.1/ 即可重新配置，"
-                   "WiFi 恢复约 5 秒后热点自动关闭。</p>"
+    send_chunk(req, "</b>，屏幕也会显示该热点的二维码，扫码加入后访问 "
+                   "http://192.168.4.1/ ；WiFi 恢复约 5 秒后热点自动关闭。"
+                   "密钥仅保存在设备 NVS，页面不回显；留空表示保持原值。</p>"
                    "<p class=\"note\">当前 WiFi: <b>");
     send_chunk(req, panda_connectivity_is_connected() ? "已连接" :
                     panda_connectivity_is_connecting() ? "连接中" : "未连接");
@@ -199,19 +221,31 @@ static esp_err_t index_get(httpd_req_t *req)
         send_chunk(req, note);
     }
 
-    send_chunk(req, "<form method=\"post\" action=\"/save\">");
-
-    send_chunk(req, "<h2>WiFi</h2><label>SSID</label>"
-                   "<input id=\"ssid\" name=\"wifi_ssid\" value=\"");
-    html_escape(cfg->wifi_ssid, esc, sizeof(esc));
-    send_chunk(req, esc);
-    send_chunk(req, "\">"
+    send_chunk(req, "<h2>已保存的 WiFi</h2>");
+    if (cfg->wifi_count == 0) {
+        send_chunk(req, "<p class=\"note\">还没有保存的网络。</p>");
+    }
+    for (int i = 0; i < cfg->wifi_count; i++) {
+        send_chunk(req, "<div class=\"net\"><span>");
+        html_escape(cfg->wifi[i].ssid, esc, esc_cap);
+        send_chunk(req, esc);
+        send_chunk(req, "</span><form method=\"post\" action=\"/wifi/delete\">"
+                       "<input type=\"hidden\" name=\"ssid\" value=\"");
+        html_escape(cfg->wifi[i].ssid, esc, esc_cap);
+        send_chunk(req, esc);
+        send_chunk(req, "\"><button type=\"submit\" class=\"del\">删除</button></form></div>");
+    }
+    send_chunk(req, "<p class=\"note\">最多保存 4 个网络；连接时按信号强度自动选择。</p>"
+                   "<form method=\"post\" action=\"/wifi\">"
+                   "<label>SSID</label><input id=\"ssid\" name=\"ssid\" required>"
                    "<button type=\"button\" class=\"scan\" id=\"scan_btn\" onclick=\"scanWifi()\">扫描附近 WiFi</button>"
                    "<select id=\"scan_result\" style=\"display:none\"></select>"
-                   "<label>密码（留空保持；更换 SSID 时留空表示开放网络）</label>"
-                   "<input type=\"password\" name=\"wifi_pass\" autocomplete=\"new-password\" placeholder=\"不修改请留空\">");
+                   "<label>密码（开放网络留空）</label>"
+                   "<input type=\"password\" name=\"pass\" autocomplete=\"new-password\" placeholder=\"开放网络留空\">"
+                   "<button type=\"submit\">保存并连接</button></form>");
 
-    send_chunk(req, "<h2>豆包实时语音</h2><label>鉴权模式</label><select name=\"api_mode\">");
+    send_chunk(req, "<h2>豆包实时语音</h2><form method=\"post\" action=\"/save\">"
+                   "<label>鉴权模式</label><select name=\"api_mode\">");
     send_chunk(req, "<option value=\"json\"");
     if (strcmp(cfg->api_mode, "o2") != 0) {
         send_chunk(req, " selected");
@@ -225,37 +259,76 @@ static esp_err_t index_get(httpd_req_t *req)
     send_chunk(req, "<label>API Key（X-Api-Key）</label>"
                    "<input type=\"password\" name=\"api_key\" placeholder=\"留空保持\">");
     send_chunk(req, "<label>App ID（O2.0）</label><input name=\"app_id\" value=\"");
-    html_escape(cfg->app_id, esc, sizeof(esc));
+    html_escape(cfg->app_id, esc, esc_cap);
     send_chunk(req, esc);
     send_chunk(req, "\"><label>Access Key（O2.0）</label>"
                    "<input type=\"password\" name=\"access_key\" placeholder=\"留空保持\">");
     send_chunk(req, "<label>App Key（O2.0，可选）</label>"
                    "<input type=\"password\" name=\"app_key\" placeholder=\"留空保持\">");
     send_chunk(req, "<label>Resource ID</label><input name=\"resource_id\" value=\"");
-    html_escape(cfg->resource_id, esc, sizeof(esc));
+    html_escape(cfg->resource_id, esc, esc_cap);
     send_chunk(req, esc);
     send_chunk(req, "\"><label>Model</label><input name=\"model\" value=\"");
-    html_escape(cfg->model, esc, sizeof(esc));
+    html_escape(cfg->model, esc, esc_cap);
     send_chunk(req, esc);
     send_chunk(req, "\"><label>音色（speaker）</label><input name=\"speaker\" value=\"");
-    html_escape(cfg->speaker, esc, sizeof(esc));
+    html_escape(cfg->speaker, esc, esc_cap);
     send_chunk(req, esc);
     send_chunk(req, "\"><label>人设</label><textarea name=\"persona\">");
-    html_escape(cfg->persona, esc, sizeof(esc));
+    html_escape(cfg->persona, esc, esc_cap);
     send_chunk(req, esc);
     send_chunk(req, "</textarea>");
 
+    send_chunk(req, "<h2>SD 卡音乐</h2>");
+    int tracks = panda_mp3_scan();
+    if (tracks <= 0) {
+        send_chunk(req, "<p class=\"note\">SD 卡 Music 文件夹里还没有 MP3。</p>");
+    } else {
+        send_chunk(req, "<p class=\"note\">已找到以下曲目（设备菜单里的“音乐播放”页按此顺序播放）：</p>");
+        for (int i = 0; i < tracks; i++) {
+            char row[32];
+            send_chunk(req, "<div class=\"net\"><span>");
+            snprintf(row, sizeof(row), "%d. ", i + 1);
+            send_chunk(req, row);
+            html_escape(panda_mp3_title(i), esc, esc_cap);
+            send_chunk(req, esc);
+            send_chunk(req, "</span></div>");
+        }
+    }
+    send_chunk(req, "<p class=\"note\">选择 MP3 文件上传到 SD 卡的 Music 文件夹（单文件 ≤ 20 MB）。"
+                   "上传完成后进入设备菜单的“音乐播放”页即可播放。</p>"
+                   "<input type=\"file\" id=\"mp3file\" accept=\".mp3,audio/mpeg\">"
+                   "<button type=\"button\" onclick=\"uploadMp3()\">上传到 SD 卡</button>"
+                   "<p class=\"note\" id=\"up_status\"></p>"
+                   "<script>"
+                   "function uploadMp3(){"
+                   "var f=document.getElementById('mp3file').files[0];"
+                   "var st=document.getElementById('up_status');"
+                   "if(!f){st.textContent='请先选择 MP3 文件';return;}"
+                   "if(!/\\.mp3$/i.test(f.name)){st.textContent='只支持 .mp3 文件';return;}"
+                   "st.textContent='上传中：0%';"
+                   "var x=new XMLHttpRequest();"
+                   "x.open('POST','/upload/music?name='+encodeURIComponent(f.name));"
+                   "x.upload.onprogress=function(e){if(e.lengthComputable){"
+                   "st.textContent='上传中：'+Math.round(e.loaded*100/e.total)+'%';}};"
+                   "x.onload=function(){if(x.status==200){st.textContent='上传完成，正在刷新列表…';"
+                   "setTimeout(function(){location.reload();},600);}"
+                   "else{st.textContent='上传失败（'+x.status+'）';}};"
+                   "x.onerror=function(){st.textContent='上传失败：网络错误';};"
+                   "x.send(f);}"
+                   "</script>");
+
     send_chunk(req, "<h2>设备</h2><div class=\"row\"><div><label>音量 0..100</label>"
                    "<input type=\"number\" name=\"volume\" min=\"0\" max=\"100\" value=\"");
-    snprintf(esc, sizeof(esc), "%d", cfg->volume);
+    snprintf(esc, esc_cap, "%d", cfg->volume);
     send_chunk(req, esc);
     send_chunk(req, "\"></div><div><label>亮度 0..100</label>"
                    "<input type=\"number\" name=\"brightness\" min=\"0\" max=\"100\" value=\"");
-    snprintf(esc, sizeof(esc), "%d", cfg->brightness);
+    snprintf(esc, esc_cap, "%d", cfg->brightness);
     send_chunk(req, esc);
     send_chunk(req, "\"></div></div><label>天气城市</label>"
                    "<input name=\"weather_city\" maxlength=\"31\" placeholder=\"例如 北京\" value=\"");
-    html_escape(cfg->weather_city, esc, sizeof(esc));
+    html_escape(cfg->weather_city, esc, esc_cap);
     send_chunk(req, esc);
     send_chunk(req, "\">"
                    "<button type=\"submit\">保存配置</button></form>"
@@ -274,22 +347,19 @@ static esp_err_t index_get(httpd_req_t *req)
                    "document.getElementById('scan_result').onchange=function(){"
                    "document.getElementById('ssid').value=this.value;};"
                    "</script></main></body></html>");
+    heap_caps_free(esc);
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
-static esp_err_t save_post(httpd_req_t *req)
+static char *read_body(httpd_req_t *req)
 {
     if (req->content_len <= 0 || req->content_len >= BODY_MAX) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
-        return ESP_FAIL;
+        return NULL;
     }
-
     char *body = heap_caps_malloc(BODY_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!body) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
-        return ESP_FAIL;
+        return NULL;
     }
-
     size_t total = 0;
     int retries = 3;
     while (total < (size_t)req->content_len) {
@@ -299,34 +369,261 @@ static esp_err_t save_post(httpd_req_t *req)
         }
         if (n <= 0) {
             heap_caps_free(body);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "recv failed");
-            return ESP_FAIL;
+            return NULL;
         }
         total += (size_t)n;
     }
     body[total] = '\0';
+    return body;
+}
+
+static esp_err_t send_result_page(httpd_req_t *req, const char *title, const char *detail)
+{
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    char page[512];
+    snprintf(page, sizeof(page),
+             "<!doctype html><meta charset=\"utf-8\">"
+             "<meta name=\"viewport\" content=\"width=device-width\">"
+             "<meta http-equiv=\"refresh\" content=\"2;url=/\">"
+             "<body style=\"font-family:sans-serif;padding:24px\"><h2>%s</h2>"
+             "<p>%s</p><p>页面 2 秒后返回。</p></body>", title, detail);
+    return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+}
+
+static void apply_wifi_settings(void)
+{
+    panda_settings_t *cfg = panda_settings_get();
+    panda_connectivity_set_credentials(cfg->wifi, cfg->wifi_count);
+}
+
+static esp_err_t wifi_post(httpd_req_t *req)
+{
+    char *body = read_body(req);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_FAIL;
+    }
+    panda_settings_t *cfg = panda_settings_get();
+    char ssid[PANDA_SSID_MAX] = {0};
+    char pass[PANDA_PASS_MAX] = {0};
+    if (!form_get(body, "ssid", ssid, sizeof(ssid)) || !ssid[0]) {
+        heap_caps_free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required");
+        return ESP_FAIL;
+    }
+    if (!form_get(body, "pass", pass, sizeof(pass))) {
+        pass[0] = '\0';
+    }
+    int index = panda_settings_wifi_index(ssid);
+    if (index >= 0 && !pass[0]) {
+        /* Re-saving an existing network without retyping the password keeps
+         * the stored one; an entirely new SSID with no password is open. */
+        snprintf(pass, sizeof(pass), "%s", cfg->wifi[index].pass);
+    }
+    if (index < 0 && cfg->wifi_count >= PANDA_WIFI_CRED_MAX) {
+        heap_caps_free(body);
+        return send_result_page(req, "保存失败", "最多只能保存 4 个 WiFi，请先删除一个。");
+    }
+    esp_err_t err = panda_settings_wifi_put(ssid, pass);
+    heap_caps_free(body);
+    if (err != ESP_OK) {
+        return send_result_page(req, "保存失败", "写入设置出错。");
+    }
+    err = panda_settings_save();
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save failed");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "wifi saved: '%s' (%d stored)", ssid, cfg->wifi_count);
+    apply_wifi_settings();
+    return send_result_page(req, "WiFi 已保存", "设备正在扫描并连接信号最强的已保存网络。");
+}
+
+static esp_err_t wifi_delete_post(httpd_req_t *req)
+{
+    char *body = read_body(req);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_FAIL;
+    }
+    char ssid[PANDA_SSID_MAX] = {0};
+    if (!form_get(body, "ssid", ssid, sizeof(ssid)) || !ssid[0]) {
+        heap_caps_free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ssid required");
+        return ESP_FAIL;
+    }
+    heap_caps_free(body);
+    esp_err_t err = panda_settings_wifi_remove(ssid);
+    if (err == ESP_OK) {
+        panda_settings_save();
+        ESP_LOGI(TAG, "wifi removed: '%s' (%d left)", ssid, panda_settings_wifi_count());
+        apply_wifi_settings();
+    }
+    return send_result_page(req, err == ESP_OK ? "已删除" : "未找到",
+                            err == ESP_OK ? "该网络已从设备移除。" : "没有这个已保存的网络。");
+}
+
+static esp_err_t upload_music_post(httpd_req_t *req)
+{
+    char query[768];
+    char name[256];
+    if (req->content_len <= 0 || req->content_len > UPLOAD_MAX_BYTES) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad size");
+    }
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "name required");
+    }
+    /* httpd_query_key_value() hands back the raw value, so Chinese names
+     * arrive percent-encoded (three bytes per character). */
+    url_decode(name);
+
+    /* Keep only the base name and a filesystem-safe charset. */
+    char *slash = strrchr(name, '/');
+    if (slash != NULL) {
+        memmove(name, slash + 1, strlen(slash + 1) + 1);
+    }
+    for (char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == '\\' || c == '?' || c == '&' || c == '%' || c == '*' ||
+            c == ':' || c == '"' || c == '<' || c == '>' || c == '|') {
+            *p = '_';
+        }
+    }
+    size_t len = strlen(name);
+    if (len <= 4 || strcasecmp(name + len - 4, ".mp3") != 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "only .mp3");
+    }
+    if (!panda_board_sdcard_mounted()) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no sdcard");
+    }
+
+    char dir[128];
+    snprintf(dir, sizeof(dir), "%.96s/Music", panda_board_sdcard_mount_point());
+    if (mkdir(dir, 0777) != 0) {
+        struct stat st;
+        if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            ESP_LOGE(TAG, "cannot create %s", dir);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mkdir failed");
+        }
+    }
+
+    char path[320];
+    snprintf(path, sizeof(path), "%.100s/%.200s", dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "cannot open %s", path);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "open failed");
+    }
+
+    /* ESP32-S3's SDMMC DMA cannot address PSRAM, so a PSRAM buffer makes
+     * FatFs fall back to one 512 B command per sector; on this slow SDSC card
+     * that is ~8 KB/s. Even with an internal buffer, FatFs only issues a
+     * multi-block write while the file offset is sector aligned; after the
+     * first partial chunk every following 512 B sector goes out as its own
+     * command (~58 ms each on this card). So fill the buffer completely and
+     * only write whole chunks: the file offset stays a multiple of the chunk
+     * size and FatFs always takes the bulk path. */
+    enum { UPLOAD_CHUNK = 16384 };
+    char *buf = heap_caps_aligned_alloc(4096, UPLOAD_CHUNK, MALLOC_CAP_DMA);
+    bool dma_buf = buf != NULL;
+    if (buf == NULL) {
+        ESP_LOGW(TAG, "no internal DMA buffer, upload will be slow");
+        buf = heap_caps_malloc(UPLOAD_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (buf == NULL) {
+        close(fd);
+        remove(path);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no memory");
+    }
+    ESP_LOGI(TAG, "upload %s: %s buffer @%p (mod4096=%u)",
+             name, dma_buf ? "dma" : "psram", buf,
+             (unsigned)((uintptr_t)buf & 4095));
+
+    int64_t start_us = esp_timer_get_time();
+    size_t total = 0;
+    size_t fill = 0;
+    bool ok = true;
+    int timeouts = 0;
+    int64_t recv_us = 0;
+    int64_t write_us = 0;
+    int64_t max_recv_us = 0;
+    int64_t max_write_us = 0;
+    while (total + fill < (size_t)req->content_len) {
+        int64_t t0 = esp_timer_get_time();
+        int n = httpd_req_recv(req, buf + fill, UPLOAD_CHUNK - fill);
+        int64_t t1 = esp_timer_get_time();
+        if (n == HTTPD_SOCK_ERR_TIMEOUT && ++timeouts <= 3) {
+            continue;
+        }
+        if (n <= 0) {
+            ok = false;
+            break;
+        }
+        recv_us += t1 - t0;
+        if (t1 - t0 > max_recv_us) {
+            max_recv_us = t1 - t0;
+        }
+        fill += (size_t)n;
+        if (fill < UPLOAD_CHUNK && total + fill < (size_t)req->content_len) {
+            continue;
+        }
+        if (write(fd, buf, fill) != (ssize_t)fill) {
+            ok = false;
+            break;
+        }
+        int64_t t2 = esp_timer_get_time();
+        write_us += t2 - t1;
+        if (t2 - t1 > max_write_us) {
+            max_write_us = t2 - t1;
+        }
+        size_t prev = total;
+        total += fill;
+        fill = 0;
+        if ((total / (1024 * 1024)) != (prev / (1024 * 1024))) {
+            ESP_LOGI(TAG, "upload %s: %u/%u KiB @%u KB/s (recv %lld ms, write %lld ms, max %lld/%lld ms)",
+                     name, (unsigned)(total / 1024),
+                     (unsigned)((size_t)req->content_len / 1024),
+                     (unsigned)(total / 1024 / ((esp_timer_get_time() - start_us) / 1000000 + 1)),
+                     recv_us / 1000, write_us / 1000,
+                     max_recv_us / 1000, max_write_us / 1000);
+        }
+        if (!dma_buf) {
+            /* The PSRAM fallback writes one 512 B sector per command and can
+             * stall long enough to trip the task watchdog. */
+            vTaskDelay(1);
+        }
+    }
+    heap_caps_free(buf);
+    close(fd);
+    if (!ok) {
+        remove(path);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write failed");
+    }
+
+    int tracks = panda_mp3_scan();
+    ESP_LOGI(TAG, "uploaded %s (%u bytes), %d track(s) on card",
+             name, (unsigned)total, tracks);
+
+    char json[160];
+    snprintf(json, sizeof(json), "{\"ok\":true,\"file\":\"%s\",\"bytes\":%u,\"tracks\":%d}",
+             name, (unsigned)total, tracks);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t save_post(httpd_req_t *req)
+{
+    char *body = read_body(req);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body");
+        return ESP_FAIL;
+    }
 
     panda_settings_t *cfg = panda_settings_get();
     char value[PANDA_PERSONA_MAX + 1];
-    bool wifi_changed = false;
 
-    if (form_get(body, "wifi_ssid", value, sizeof(value)) && value[0]) {
-        if (strcmp(value, cfg->wifi_ssid) != 0) {
-            wifi_changed = true;
-        }
-        copy_field(cfg->wifi_ssid, sizeof(cfg->wifi_ssid), value);
-    }
-    if (form_get(body, "wifi_pass", value, sizeof(value))) {
-        if (value[0] || wifi_changed) {
-            /* A new password for the same SSID must also trigger a reconnect;
-             * previously only an SSID change did, so "save" appeared to do
-             * nothing after fixing a typo in the password. */
-            if (strcmp(value, cfg->wifi_pass) != 0) {
-                wifi_changed = true;
-            }
-            copy_field(cfg->wifi_pass, sizeof(cfg->wifi_pass), value);
-        }
-    }
     if (form_get(body, "api_mode", value, sizeof(value))) {
         if (!strcmp(value, "o2") || !strcmp(value, "json")) {
             copy_field(cfg->api_mode, sizeof(cfg->api_mode), value);
@@ -383,19 +680,7 @@ static esp_err_t save_post(httpd_req_t *req)
     app_core_settings_changed();
     app_weather_refresh();
 
-    if (cfg->wifi_ssid[0] && (wifi_changed || !panda_connectivity_is_connected())) {
-        panda_connectivity_connect(cfg->wifi_ssid, cfg->wifi_pass);
-    }
-
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_send(req,
-        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">"
-        "<meta http-equiv=\"refresh\" content=\"2;url=/\">"
-        "<body style=\"font-family:sans-serif;padding:24px\"><h2>保存成功</h2>"
-        "<p>WiFi 正在连接，页面 2 秒后返回。</p>"
-        "<p>若 20 秒内仍连不上，设备会自动开启热点，连上热点后访问 http://192.168.4.1/ 重试。</p>"
-        "</body>", HTTPD_RESP_USE_STRLEN);
+    return send_result_page(req, "保存成功", "豆包语音配置已保存，下次启动语音模块时生效。");
 }
 
 static esp_err_t status_get(httpd_req_t *req)
@@ -407,7 +692,7 @@ static esp_err_t status_get(httpd_req_t *req)
              "{\"wifi\":\"%s\",\"ip\":\"%s\",\"ap\":\"%s\",\"ap_ip\":\"%s\","
              "\"connected\":%s,\"connecting\":%s,\"heap\":%u,"
              "\"rssi\":%d,\"reason\":%u,\"reason_hint\":\"%s\","
-             "\"ap_auto\":%s,\"retry_ms\":%u}",
+             "\"ap_auto\":%s,\"retry_ms\":%u,\"wifi_saved\":%d}",
              panda_connectivity_is_connected() ? "connected" :
              panda_connectivity_is_connecting() ? "connecting" :
              panda_connectivity_is_ap() ? "ap" : "idle",
@@ -421,7 +706,8 @@ static esp_err_t status_get(httpd_req_t *req)
              (unsigned)panda_connectivity_disconnect_reason(),
              panda_connectivity_disconnect_hint(),
              panda_connectivity_ap_auto_started() ? "true" : "false",
-             (unsigned)panda_connectivity_retry_delay_ms());
+             (unsigned)panda_connectivity_retry_delay_ms(),
+             panda_settings_wifi_count());
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
@@ -479,14 +765,38 @@ esp_err_t app_provisioning_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 13;
+    /* 8 KB did not fit in the fragmented internal heap right after SoftAP
+     * start: httpd_start bound port 80, then failed to create its task, and
+     * IDF does not close the listen socket on that path. Every later retry
+     * then failed with EADDRINUSE (112).
+     * The music upload handler needs the 8 KB: FatFs + SDMMC write paths plus
+     * the request buffers overflowed a 4 KB httpd stack at ~1 MB into a file.
+     * After the LVGL/MP3 pools moved to PSRAM the internal heap is large
+     * enough, and a start is refused unless a contiguous block is available,
+     * so a failure never leaks the port. */
     config.stack_size = 8192;
     config.lru_purge_enable = true;
+    /* Phones keep the captive-portal probe socket open for a few seconds
+     * while their "no internet" check runs; the defaults (5 s) made the
+     * first page load fail on some Android builds. */
+    config.max_open_sockets = 4;
+    config.backlog_conn = 4;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
     config.uri_match_fn = httpd_uri_match_wildcard;
+
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (largest < config.stack_size + 2048) {
+        ESP_LOGW(TAG, "defer httpd: largest internal block %u < %u",
+                 (unsigned)largest, (unsigned)(config.stack_size + 2048));
+        return ESP_ERR_NO_MEM;
+    }
 
     esp_err_t err = httpd_start(&s_server, &config);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "httpd start failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "httpd start failed: %s (largest internal %u)",
+                 esp_err_to_name(err), (unsigned)largest);
         s_server = NULL;
         return err;
     }
@@ -494,6 +804,9 @@ esp_err_t app_provisioning_start(void)
     const httpd_uri_t uris[] = {
         {.uri = "/", .method = HTTP_GET, .handler = index_get},
         {.uri = "/save", .method = HTTP_POST, .handler = save_post},
+        {.uri = "/wifi", .method = HTTP_POST, .handler = wifi_post},
+        {.uri = "/wifi/delete", .method = HTTP_POST, .handler = wifi_delete_post},
+        {.uri = "/upload/music", .method = HTTP_POST, .handler = upload_music_post},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_get},
         {.uri = "/api/scan", .method = HTTP_GET, .handler = scan_get},
         {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_get},
