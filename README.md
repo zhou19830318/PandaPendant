@@ -52,8 +52,8 @@ cd panda_ai
 idf.py build
 ```
 
-当前产物约 8.20MB（`0x82f350`，固件版本 2.0.0），factory 分区剩余 18%
-（`0x1d0cb0`）。其中约 96KB 来自音乐页图标所需的 48px Montserrat 字体
+当前产物约 8.21MB（`0x835000`，固件版本 2.0.0），factory 分区剩余 18%
+（`0x1cb000`）。其中约 96KB 来自音乐页图标所需的 48px Montserrat 字体
 （`CONFIG_LV_FONT_MONTSERRAT_48=y`，固定在 `sdkconfig.defaults`）。
 
 主机侧自检（不需要设备）：
@@ -94,18 +94,21 @@ idf.py -p /dev/ttyACM0 flash monitor
 启动后按回车，提示符 `panda>`，输入 `help` 查看全部命令。常用：
 
 ```text
-status                          # 固件/UI/电池/堆状态；app 行含主循环 loops/max_gap/age
+status                          # 固件/UI/电池/堆状态；含 reset 原因；app 行含主循环 loops/max_gap/age
 ui state listening              # idle|connecting|listening|thinking|speaking|offline|error
-ui emotion happy                # neutral|happy|surprise|sad|sleepy|curious|shy|angry
+ui emotion happy                # neutral|happy|surprise|sad|sleepy|curious|shy|angry；说话中设置会保留整轮，字幕不丢
 ui error asr                    # asr|llm|tts|audio|network|auth|generic|clear
 ui device boot|ready|low|charging   # 设备状态屏
-ui sleep | ui wake              # 睡眠/唤醒（同时控制 RGB 灯环）
+ui sleep                        # 真深睡（屏灭、单颗暗灯、BOOT 键唤醒）
+ui sleep ui                     # 仅进入 UI 睡眠（诊断，Wi-Fi/语音仍在线）
+ui wake                         # 从 UI 睡眠唤醒；深睡只能按 BOOT
 ui images                       # 37 屏图片解码自检（无屏可用）
 ui status 正在连接              # 顶部状态 pill
 ui subtitle 你好呀              # 字幕 pill（ASR 在最终转写完成后显示一次）
 ui toast 测试提示               # toast
 ui audio 70                     # 模拟音频电平 0..100
 ui volume 70                    # 模拟系统音量显示
+ui menu next|prev|home          # 切换菜单页（与 KEY3/左右滑同一套轮转）
 touch tap|double|long|left|right|up|down
 touch diag                      # 触摸面板原始读检查（ID/坐标寄存器/自动休眠）
 key 1|2|3|boot [long]           # 注入按键动作（boot long = 切换配网模式）
@@ -124,6 +127,7 @@ wifi [status|scan|connect <ssid> [pass]|disconnect|forget|ap on|off|sync|recover
 # voice stats 输出 TTS 计数：deltas/ring_drops/underruns/write_retries/rx_overflows
 # voice pump off 关闭对话间 50ms 静音上行（诊断用；关闭后服务端会因无音频输入关会话）
 audio test | audio status | audio tone [seconds]   # tone 连续 880Hz（诊断用）
+# audio status 输出 out=on/off（功放是否通电）；audio mute on|off 立即关断/恢复输出
 rgb status | rgb mode off|state|audio|full|manual | rgb brightness [0..100]
 rgb <r> <g> <b> | rgb off            # 手动常亮单色 / 关闭灯环
 # rgb status 输出 mode/brightness/level/refresh；level 为最近 250ms 的输出峰值 0..100
@@ -142,15 +146,18 @@ heap | reboot
 
 | 按键 | 操作 | 功能 |
 |---|---|---|
+| BOOT (GPIO0) | 短按（深睡时） | **唯一唤醒键**：设备从深睡冷启动 |
 | BOOT (GPIO0) | 长按 4s | 进入/退出配网模式（开启 SoftAP + 配网页，再按 4s 关闭）；短按提示 |
 | 触摸屏 | 长按 600ms | 按住说话（PTT），松开提交；BOOT 不再触发 PTT |
 | KEY1 (TCA9555 P1.1) | 短按 / 按住 | 音量 −10%（按下即生效，按住每 250ms 重复；MP3 播放中同样立即生效；保存 NVS） |
 | KEY2 (TCA9555 P1.2) | 短按 / 按住 | 音量 +10%（同上） |
-| KEY3 (TCA9555 P1.3) | 短按 | 切换菜单：快捷设置→人格设置→睡眠设置→系统设置→设备信息→时间天气→音乐播放 循环 |
+| KEY3 (TCA9555 P1.3) | 短按 | 即时切换菜单（无淡入）：快捷设置→人格设置→睡眠设置→系统设置→设备信息→时间天气→音乐播放 循环 |
 | KEY3 | 长按 600ms | 返回主屏（退出菜单） |
+| 触摸屏（菜单页） | 左滑 / 右滑 | 切换到下一页 / 上一页（循环）；上滑返回主屏 |
 
 KEY1–3 经 TCA9555 轮询（20ms），只有 BOOT 能作为深睡唤醒源。
 菜单页与触摸手势共用同一批生成页面；语音/错误/低电等紧急状态仍会抢占菜单。
+左/右滑只在七个菜单页生效，主屏与状态页保留各自的生成手势。
 
 ## RGB 灯环
 
@@ -183,17 +190,22 @@ KEY3 打开的七个页面均可触摸操作；设置类选择写入 NVS，音�
 
 | 页面 | 行为 |
 |---|---|
-| 快捷设置 | Wi-Fi 开/关（无凭证时开配网 AP）、勿扰=扬声器静音、睡眠按钮进入睡眠；蓝牙 tile 隐藏（无 BT 协议栈） |
+| 快捷设置 | Wi-Fi 开/关（无凭证时开配网 AP）、勿扰=扬声器静音、睡眠按钮进入真深睡；蓝牙 tile 隐藏（无 BT 协议栈），亮度/音量 tile 已移除（统一在系统设置页调节） |
 | 人格设置 | 性格（活泼/温柔/安静）、反馈强度（弱/中/强）、动画活跃度（低/中/高）；性格与反馈拼入下一轮对话提示词，动画映射切屏时长 0/150/250ms |
-| 睡眠设置 | 自动休眠 1/5/10 分钟或从不；唤醒方式（触摸/语音/都可以）；睡眠动画开关。语音唤醒尚未实现，选它会提示 |
-| 系统设置 | 真实亮度/音量滑块（拖动预览，松手保存）；百分比、Wi-Fi、时间同步状态周期刷新 |
-| 设备信息 | 真实 SD 已用/总容量与固件版本 `v2.0.0` |
-| 时间天气 | 时钟/日期随 RTC/SNTP 更新；天气来自 Open-Meteo，城市可在配网页或 `weather set` 修改 |
-| 音乐播放 | 顶部为圆形音乐图标徽章（48px 音符）；扫描 SD 卡 `Music` 目录，显示歌曲名/序号与播放状态；上一首、暂停/播放、下一首、退出。退出页面即停止播放并释放解码音频资源，恢复 16kHz 语音时钟。播放使用约 0.35s 预缓冲与 10ms 淡入淡出，切换采样率只在每首开始时静音进行一次 |
+| 睡眠设置 | 自动休眠 1/5/10 分钟或从不；唤醒键固定为 BOOT（触摸/语音选项已隐藏）；睡眠动画开关 |
+| 系统设置 | 真实亮度/音量滑块（拖动预览，松手保存）、时间同步状态与存储与版本入口；Wi-Fi 状态与开关只在快捷设置页显示，避免重复 |
+| 设备信息 | 真实 SD 已用/总容量与固件版本 `v2.0.0`；SquareLine 导出的“角色预览/表情管理/动画管理”入口已隐藏（内容为写死的演示数据，未接固件，点缩略图也会在 50ms 内被状态机拉回） |
+| 时间天气 | 时钟/日期随 RTC/SNTP 更新；天气行从左到右为中文城市、天气图标、温度，整行居中；城市可在配网页或 `weather set` 修改 |
+| 音乐播放 | 顶部为圆形音乐图标徽章（48px 音符）；进入页面先显示“扫描中”，扫描 SD 卡 `Music` 目录，随后显示歌曲名/序号与播放状态；上一首、暂停/播放、下一首、退出。退出页面即停止播放并释放解码音频资源，恢复 16kHz 语音时钟。播放使用约 0.35s 预缓冲与 10ms 淡入淡出，切换采样率只在每首开始时静音进行一次 |
 
-自动休眠默认 300s：设备未睡、语音空闲且 5 分钟无触摸/按键/语音事件时进入睡眠；
-睡眠时 RGB 灯环熄灭，触摸或按键唤醒并显示 1.2s 唤醒屏（唤醒的那次输入不会同时
-触发原动作，灯环白色爆闪）。
+自动休眠默认 300s：设备未睡、语音空闲且 5 分钟无触摸/按键/语音事件时进入**真深睡**：
+先显示 1.5s 睡眠屏，然后关背光/面板、停 WiFi 与语音、卸载 SD，灯环只留第 1 颗
+极暗绿灯并锁存数据线。**音乐播放期间不算空闲**：播放在计时窗口内持续刷新活动时间，
+且已排队的自动休眠若在 1.5s 预备期内检测到音乐起播会取消（日志
+`auto deep sleep deferred: music playing`）；停止播放后重新从 0 开始计时。
+深睡时只有 **BOOT（GPIO0）** 能唤醒，唤醒等于冷启动；
+KEY1–3 和触摸都接在 TCA9555 上，没有 INT 线到 ESP32，无法唤醒。
+睡眠设置页的唤醒方式因此固定为 BOOT。
 天气成功时 30 分钟刷新，失败 60 秒重试，离线每 10 秒检查网络；图标只有晴/多云/阴三类。
 
 ## 配网页、WiFi 与音乐上传
@@ -222,7 +234,8 @@ KEY3 打开的七个页面均可触摸操作；设置类选择写入 NVS，音�
 - `components/panda_ui/generated/` 来自 `demo/ui` 的 SquareLine 导出，已按屏幕重命名冲突符号
   （例如 `ui_home_face`、`ui_listening_event_face`），并修复 `thinkdot1_Animation` 大小写。
 - `components/panda_state/` 实现 PRD 8.3 的三维状态机：设备、语音、情绪相互独立，
-  屏幕优先级 `sleep > low_battery > error > wake > offline > voice > emotion > idle`，
+  屏幕优先级 `sleep > low_battery > error > wake > offline > voice > emotion > idle`
+  （说话中若已有表情则显示表情屏并叠加字幕；回合内表情保留到回合结束），
   并带 wake/情绪/错误/连接/聆听/思考/取消超时。
 - `panda_ui.c` 只做映射：把状态机输出的屏幕枚举切到 37 个生成屏之一，并维护
   `lv_layer_top()` 上的状态、字幕、toast overlay；设置/通知/预览页不会被普通状态抢占。
@@ -230,8 +243,10 @@ KEY3 打开的七个页面均可触摸操作；设置类选择写入 NVS，音�
   自下而上循环滚动，新字幕到来会先复位动画。字幕框宽 200px、位于屏幕下 1/4
   （y=270..318），四角留在圆形可视区内；字幕出现时状态 pill 自动隐藏，
   带底部提示的屏幕（离线/重连/报错/低电）也不再叠加状态文字。
-- 屏幕导航（上下左右滑动、菜单点击）由生成 UI 负责；`app_core` 处理
-  双击电量提示、长按 PTT、BOOT 键、菜单钩子、自动休眠与系统周期任务，避免手势重复消费。
+- 屏幕导航：主屏/状态页的上下左右手势仍由生成 UI 负责；七个菜单页的左/右滑改由
+  `panda_ui` 的菜单回调处理（左=下一页、右=上一页、上=回主屏），替换了 SquareLine
+  生成的固定跳转，避免与 KEY3 的循环顺序冲突。`app_core` 处理双击电量提示、
+  长按 PTT、BOOT 键、菜单钩子、自动休眠与系统周期任务，避免手势重复消费。
 - 图片全部编译进固件；`ui images` 遍历 37 屏图片对象并调用 LVGL 解码器校验，
   主机侧 `tools/ui_sim/check_images.py` 逐字节校验描述符与像素数据。
 
@@ -239,21 +254,31 @@ KEY3 打开的七个页面均可触摸操作；设置类选择写入 NVS，音�
 
 - 真机当前连接电池、SD 卡、1.85" 屏、喇叭与触摸。CST816S 会自动进入低功耗导致
   坐标读取 NACK，固件已写 `0xFE=0x01` 关闭自动休眠，长按 PTT 与 `touch diag` 实测正常；
-  单击/双击/滑动与休眠唤醒仍待逐项验收。
+  单击/双击/滑动仍待逐项验收（深睡下触摸无法唤醒）。
 - 已实测：I2C0/TCA9555、RTC 读写与跨复位保持、SD 挂载、RGB、ES8311/ES7210 初始化、
   麦克风采集、WiFi STA/SoftAP/SNTP、配网 HTTP（首页/状态/保存）、
   JSON 云端语音（`voice clip`→TTS→回复文本）与 `voice cancel` 打断。
-  RGB 灯环的待机/播放/暂停/音量/睡眠/唤醒逻辑已用串口计数验证（播放约 20 次/秒刷新、
+  RGB 灯环的待机/播放/暂停/音量/UI 睡眠/唤醒逻辑已用串口计数验证（播放约 20 次/秒刷新、
   暂停后电平归零、睡眠后刷新停止），默认 45% 亮度下的颜色与亮度观感待用户目视验收。
-- 进入音乐页时同步扫描 `Music` 目录（46 首），约 1.5–2s 内界面会停顿一次
-  （日志 `loop stall ~1.5–2s in voice-ui`），播放本身不受影响。
+- 进入音乐页会在低优先级任务里扫描 `Music` 目录（46 首），期间页面显示“扫描中”；
+  扫描不再阻塞按键/触摸，切页可立即继续（此前扫描/停止跑在主循环里，会卡死数秒）。
+- KEY3 翻页曾偶发卡死（屏幕、按键与串口 CLI 同时失去响应，显示锁被长期占用），
+  重新上电可恢复。固件现会先打印
+  `display lock stuck 3s (caller=... holder=... held=...ms lvgl ticks=...)`，
+  10s 仍拿不到锁则自动重启；正常渲染竞争实测最长约 260ms，不会触发。
+  根因仍在定位，若再次遇到请保留串口日志。
 - 状态机与 UI 映射已通过主机 46 项断言和真机切屏验证；58 张编译图片经主机解析校验
   与真机 LVGL 解码器校验（37 屏/71 对象/58 唯一/0 失败）。屏已接，实际像素/色彩/帧率待逐屏验收。
 - 语音已实现 demo 的 JSON 链路（会话、PCM 上行、TTS 播放、24k→16k 重采样、打断）；
   TTS 播放按 demo 改为多相重采样、500ms 预缓冲、启动/续播淡入、停顿淡出、暂停回滞与
   700ms 静音冲刷，日志每 5s 输出 `play loop: ring/peak/nearclip`；ASR 只渲染最终转写，
   避免 delta 重复叠加。可用 `voice stats` 观察 `underruns`/`ring_drops`/`rx_overflows`；
-  官方 O2.0 二进制协议未实现，需要控制台的 app_id/access_key。
+  官方 O2.0 二进制协议已实现（`api_mode=o2`）：WS 二进制帧、StartConnection/
+  StartSession/音频上行/FinishSession 打断、gzip 解包、服务端 VAD/TTS 事件解析。
+  需在控制台开通“端到端实时语音”并配置 `settings set app_id/access_key`（可选
+  `resource_id`、`app_key`），改完 `api_mode` 后重启生效；JSON 模式仍为默认回退。
+  O2 链路已真机验证：连接→会话→ASR→回复→TTS（`status=0`），测试音频与真人
+  触摸 PTT 均通过，取消后可自动重建会话。
 - WiFi STA/SoftAP/SNTP 与配网网页已接入：无凭证时开机 SoftAP；有凭证但 20s 未联网时
   自动回退 SoftAP（首页显示断线原因）。配网页在 AP 或 STA 任一联网时运行，
   STA 在线可直接访问 `http://<设备IP>/`，网络全断时自动停止；STA 恢复后自动回退的
@@ -278,6 +303,21 @@ KEY3 打开的七个页面均可触摸操作；设置类选择写入 NVS，音�
   （TCP 窗口 5.7KB、WS buffer 4096）。真机 12/12 轮合成语音全链路通过、0 丢包。
 - 喇叭已接；抗爆音/抗卡死策略已烧录。内置 `voice clip` 可完整走通
   ASR→回复→TTS 播放（实测转写“你是谁呀你叫什么名字”），真人语音的听感验收待完成。
+- 功放（PA）现在只在真正写 PCM 时开启：第一块音频到达时开 PA（等 20ms 稳定后
+  解除 DAC 静音），连续 800ms 没有写入就先把 DAC 静音、再关 PA；勿扰模式会立即
+  关断。实测空闲时喇叭完全无声（此前 PA 常开有持续滋滋声）。播放过程中的残余
+  底噪来自功放通电本身（分段实测：DAC 静音但 PA 开仍有滋滋声），软件只能缩短
+  其通电时间，彻底消除需要改善功放供电/滤波（硬件）。`audio status` 新增
+  `out=on/off` 显示当前功放状态。
+- O2 模式的已知限制：整段对话共用一个 session，断句由服务端 VAD（`end_smooth_window_ms=1500`）
+  决定，客户端不再发送 commit；说话中再次按 PTT 会先 `FinishSession` 再新建会话，
+  建会话期间的开头几句可能被丢弃。串口 `voice stats` 的 `deltas` 在 O2 下统计 TTS
+  音频帧数。O2 链路已真机联通（`O2 connection started`/`session started`/ASR/TTS
+  `status=0`），缺 `access_key` 时只打一条警告且不崩溃/不重连风暴。TTS 音频按生成
+  速度突发到达，环形缓冲已扩到 768K 样本（约 48s@16k）；超过约 48s 的回复仍会
+  丢掉尾部。`voice cancel` 会关闭当前会话，下一次 PTT 或 `voice clip` 自动新建。
+  O2 的 `dialog.model` 固定为 `1.2.1.1`（端到端模型版本），`settings set model`
+  只影响 JSON 模式。
 - MP3 播放已改为“解码任务 + I2S 写入任务 + 32K 样本 PSRAM 环形缓冲”：16K 样本
   预缓冲（44.1k 约 0.37s）、起播/续播淡入、曲尾淡出；文件采样率与语音时钟不同时，
   只在每首开始、写入端空闲且静音时切换一次（支持 22.05/24/32/44.1/48kHz），
@@ -302,11 +342,23 @@ KEY3 打开的七个页面均可触摸操作；设置类选择写入 NVS，音�
   KEY1/2 音量键仍建议用 `key 1|2|3 [long]` 做串口预演确认物理顺序。
 - 菜单功能（滑块、Wi-Fi 开关、勿扰静音、自动休眠/唤醒、个性化持久化、SD/版本、天气、
   音乐播放）已在真机操作；屏幕/触摸/喇叭均已连接。
-- 语音唤醒未实现：睡眠设置里的“语音唤醒”只会提示暂不支持，触摸/按键仍可唤醒。
+- 语音唤醒未实现；深睡只能按 BOOT 唤醒，KEY1–3/触摸无法唤醒（见下条硬件原因）。
 - 固件未链接蓝牙协议栈，快捷设置的蓝牙入口已隐藏；需要 BT 配网/音频需另行评估。
-- 天气使用 Open-Meteo（无需 Key），需要联网；只有晴/多云/阴三种图标，尚未取到数据时显示 `--`，
+- 天气使用 Open-Meteo（无需 Key），需要联网；时间天气页天气行显示
+  “城市 · 图标 · 温度”，整行 flex 居中。城市设置（默认北京，可用配网页或
+  `weather set` 修改）用于地理编码；页面显示地理编码返回的中文名（如
+  `Changzhou` → `常州市`），该中文名缓存在 NVS，重启/离线也显示中文。
+  中文地名直接查询 Open-Meteo 可能无结果，建议填英文或拼音。
+  只有晴/多云/阴三种图标，尚未取到数据时温度显示 `--`（城市仍按设置显示），
   取数失败保留上一次结果。
-- 自动休眠只是 UI 睡眠，Wi-Fi 与语音连接仍在线，不做深睡省电。
+- 自动休眠/菜单睡眠/`ui sleep` 现在进入真深睡：屏幕与背光关闭，Wi-Fi/语音/音频/
+  SD 全部关停，只剩一颗锁存的极暗绿灯（约 1–2mA，取决于灯带供电轨是否保持）。
+  WS2812 在 GPIO38，不是 RTC GPIO，深睡期间无法刷新，所以**做不了呼吸动画**。
+  唤醒只能按 BOOT（GPIO0）；KEY1–3 与触摸位于 TCA9555，深睡时 I2C 已断电且
+  没有 INT 线连到 ESP32。深睡唤醒是冷启动（约 1–2s），不是恢复现场。
+  实测 `ui sleep` 后轻按 BOOT：开机日志 `woke from deep sleep (cause=2, BOOT)`，
+  屏幕/灯环/网络/SD 全部恢复；短按不会进下载模式。
+  `ui sleep ui` 仍保留 UI 睡眠用于诊断；`ui wake` 只对 UI 睡眠有效。
 - O2.0 控制台权限/模型版本待确认；JSON 链路已用现有 api_key 跑通。
 - 内部 RAM 启动后约 114KB（实测 `internal=114439`，最大块 63KB）；进入音乐页/播放时
   约 84KB（最大块 48KB），上传时约 94–103KB。LVGL 的 96KB widget 池与 MP3 曲目表

@@ -23,6 +23,12 @@ static const char *TAG = "audio";
 
 #define MIC_GAIN_DB 37.5f
 #define DEFAULT_VOLUME 70
+/* The PA and its supply are the audible idle noise floor (verified: PA off is
+ * silent, DAC mute with PA on still hisses), so the PA stays off until PCM is
+ * actually written and is cut again after this much silence. */
+#define OUTPUT_IDLE_MS 800
+#define OUTPUT_SETTLE_MS 20
+#define OUTPUT_MUTE_GUARD_MS 15
 
 static i2s_chan_handle_t s_tx;
 static i2s_chan_handle_t s_rx;
@@ -43,6 +49,8 @@ static int s_volume = DEFAULT_VOLUME;
 static volatile int s_out_level;
 static volatile int64_t s_out_level_us;
 static bool s_muted;
+static volatile bool s_out_on;
+static int64_t s_last_play_us;
 static bool s_ready;
 static bool s_has_mic;
 static uint32_t s_rate = PANDA_AUDIO_RATE;
@@ -177,6 +185,31 @@ static esp_err_t codec_in_init(const audio_codec_data_if_t *data_if)
     return ESP_OK;
 }
 
+/* Both helpers run with s_ctl_lock held. The DAC is muted before the PA drops
+ * and the PA gets time to settle before the DAC unmutes, so gating the
+ * amplifier does not click. */
+static void output_sleep_locked(void)
+{
+    if (!s_out_on) {
+        return;
+    }
+    esp_codec_dev_set_out_mute(s_out, true);
+    vTaskDelay(pdMS_TO_TICKS(OUTPUT_MUTE_GUARD_MS));
+    panda_board_pa_enable(false);
+    s_out_on = false;
+}
+
+static void output_wake_locked(void)
+{
+    if (s_out_on) {
+        return;
+    }
+    panda_board_pa_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(OUTPUT_SETTLE_MS));
+    esp_codec_dev_set_out_mute(s_out, s_muted);
+    s_out_on = true;
+}
+
 static esp_err_t codecs_open(void)
 {
     esp_codec_dev_sample_info_t fs = {
@@ -191,9 +224,13 @@ static esp_err_t codecs_open(void)
         return ESP_FAIL;
     }
     esp_codec_dev_set_out_vol(s_out, s_volume);
-    /* Re-opening the codec drops the mute register, so re-apply it. */
-    esp_codec_dev_set_out_mute(s_out, s_muted);
-    panda_board_pa_enable(true);
+    /* The powered amplifier is the noise source, so opening the codec keeps
+     * it muted and the PA off; output_wake_locked() brings both up when the
+     * first PCM block arrives. Re-opening also drops the mute register. */
+    esp_codec_dev_set_out_mute(s_out, true);
+    panda_board_pa_enable(false);
+    s_out_on = false;
+    s_last_play_us = 0;
 
     if (s_in != NULL) {
         fs.channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0);
@@ -288,6 +325,7 @@ esp_err_t panda_audio_set_rate(uint32_t sample_rate)
     xSemaphoreTake(s_rx_lock, portMAX_DELAY);
     xSemaphoreTake(s_ctl_lock, portMAX_DELAY);
 
+    output_sleep_locked();
     esp_codec_dev_close(s_out);
     if (s_in != NULL && s_has_mic) {
         esp_codec_dev_close(s_in);
@@ -376,7 +414,19 @@ esp_err_t panda_audio_play(const int16_t *buffer, size_t samples, size_t *sample
     if (xSemaphoreTake(s_tx_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
+    /* Only the block that actually starts the amplifier pays the settle
+     * delay. DND keeps the PA down; the PCM is still drained at real time so
+     * the pipeline does not overrun. */
+    if (!s_muted && !s_out_on) {
+        if (xSemaphoreTake(s_ctl_lock, pdMS_TO_TICKS(CTL_LOCK_TIMEOUT_MS)) != pdTRUE) {
+            xSemaphoreGive(s_tx_lock);
+            return ESP_ERR_TIMEOUT;
+        }
+        output_wake_locked();
+        xSemaphoreGive(s_ctl_lock);
+    }
     int ret = esp_codec_dev_write(s_out, (void *)buffer, samples * sizeof(int16_t));
+    s_last_play_us = esp_timer_get_time();
     xSemaphoreGive(s_tx_lock);
     if (ret != 0) {
         return ESP_FAIL;
@@ -446,9 +496,39 @@ esp_err_t panda_audio_mute(bool mute)
     int ret = esp_codec_dev_set_out_mute(s_out, mute);
     if (ret == 0) {
         s_muted = mute;
+        /* DND must silence the amplifier too: the codec mute alone leaves the
+         * PA powered and that is exactly what hisses. */
+        if (mute) {
+            output_sleep_locked();
+        }
     }
     xSemaphoreGive(s_ctl_lock);
     return ret == 0 ? ESP_OK : ESP_FAIL;
+}
+
+void panda_audio_poll(void)
+{
+    if (!s_ready || s_out == NULL || !s_out_on) {
+        return;
+    }
+    if (esp_timer_get_time() - s_last_play_us < OUTPUT_IDLE_MS * 1000LL) {
+        return;
+    }
+    if (xSemaphoreTake(s_tx_lock, 0) != pdTRUE) {
+        return;
+    }
+    if (s_out_on &&
+        esp_timer_get_time() - s_last_play_us >= OUTPUT_IDLE_MS * 1000LL &&
+        xSemaphoreTake(s_ctl_lock, pdMS_TO_TICKS(CTL_LOCK_TIMEOUT_MS)) == pdTRUE) {
+        output_sleep_locked();
+        xSemaphoreGive(s_ctl_lock);
+    }
+    xSemaphoreGive(s_tx_lock);
+}
+
+bool panda_audio_output_on(void)
+{
+    return s_out_on;
 }
 
 int panda_audio_get_output_level(void)

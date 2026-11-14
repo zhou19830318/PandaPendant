@@ -3,6 +3,7 @@
 #include "panda_board_pins.h"
 #include "esp_lcd_st77916.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
 #include "esp_log.h"
@@ -11,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
+#include "driver/gpio.h"
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -75,6 +77,27 @@ esp_err_t panda_display_set_brightness(int percent)
 int panda_display_get_brightness(void)
 {
     return s_brightness;
+}
+
+esp_err_t panda_display_prepare_deep_sleep(void)
+{
+    esp_err_t err = panda_display_set_brightness(0);
+    if (s_panel) {
+        esp_err_t panel_err = esp_lcd_panel_disp_on_off(s_panel, false);
+        if (err == ESP_OK) {
+            err = panel_err;
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    /* LEDC is off in deep sleep; without a hold the backlight pad floats and
+     * can light the panel through its driver. */
+    gpio_reset_pin(PANDA_LCD_BL);
+    gpio_set_direction(PANDA_LCD_BL, GPIO_MODE_OUTPUT);
+    gpio_set_level(PANDA_LCD_BL, 0);
+    gpio_hold_en(PANDA_LCD_BL);
+    gpio_deep_sleep_hold_en();
+    ESP_LOGI(TAG, "display off (backlight held low)");
+    return err;
 }
 
 esp_err_t panda_display_set_invert(bool invert)
@@ -196,6 +219,8 @@ esp_err_t panda_display_init(void)
     if (s_ready) {
         return ESP_OK;
     }
+    /* Release the deep-sleep hold applied by panda_display_prepare_deep_sleep. */
+    gpio_hold_dis(PANDA_LCD_BL);
     ESP_RETURN_ON_ERROR(backlight_init(), TAG, "backlight init");
     int target_brightness = s_brightness;
     panda_display_set_brightness(0);
@@ -226,14 +251,62 @@ esp_lcd_panel_io_handle_t panda_display_panel_io(void)
     return s_io;
 }
 
+static TaskHandle_t s_lock_task;
+static const char *s_lock_site = "?";
+static int64_t s_lock_since_us;
+static int s_lock_depth;
+
+bool panda_display_lock_at(uint32_t timeout_ms, const char *site)
+{
+    int64_t t0 = esp_timer_get_time();
+    if (!lvgl_port_lock(timeout_ms)) {
+        ESP_LOGE(TAG, "lock timeout %ums: waiter=%s holder=%s", (unsigned)timeout_ms,
+                 pcTaskGetName(NULL),
+                 s_lock_depth ? pcTaskGetName(s_lock_task) : "lvgl-task");
+        return false;
+    }
+    if (s_lock_depth == 0) {
+        s_lock_task = xTaskGetCurrentTaskHandle();
+        s_lock_site = site;
+        s_lock_since_us = t0;
+    }
+    s_lock_depth++;
+    return true;
+}
+
 bool panda_display_lock(uint32_t timeout_ms)
 {
-    return lvgl_port_lock(timeout_ms);
+    return panda_display_lock_at(timeout_ms, "?");
 }
 
 void panda_display_unlock(void)
 {
+    if (s_lock_depth > 0) {
+        s_lock_depth--;
+        if (s_lock_depth == 0) {
+            int64_t held = esp_timer_get_time() - s_lock_since_us;
+            if (held > 500000) {
+                ESP_LOGW(TAG, "display lock held %lld ms by %s", (long long)(held / 1000), s_lock_site);
+            }
+            s_lock_task = NULL;
+        }
+    }
     lvgl_port_unlock();
+}
+
+void panda_display_lock_info(char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) {
+        return;
+    }
+    if (s_lock_depth <= 0) {
+        /* Held inside the lvgl task (timer/event callback) or never taken. */
+        snprintf(buf, len, "holder=lvgl-task(no panda_display_lock holder recorded)");
+        return;
+    }
+    snprintf(buf, len, "holder=%s site=%s held=%lldms depth=%d",
+             pcTaskGetName(s_lock_task), s_lock_site,
+             (long long)((esp_timer_get_time() - s_lock_since_us) / 1000), s_lock_depth);
 }
 
 esp_err_t panda_display_fill_rgb565(uint16_t color)

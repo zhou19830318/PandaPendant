@@ -816,3 +816,310 @@ TCA9555 的输出锁存器复位值为 `0xFF`。初始化必须先 `set_dir(out_
   `PRIV_REQUIRES esp_timer`（`panda_audio` 新增电平时间戳同理）。
 - 串口 `ui sleep|wake` 只调 UI 会与灯环状态脱节；两处都要同步
   `panda_led_set_sleeping()`，唤醒再加 `panda_led_notify_wake()`。
+
+## 20. 菜单切页不要前台胶囊（2026-11-14）
+
+- KEY3 短按原本在 `panda_ui_menu_next()` 后调用 `panda_ui_toast(page, 800)`，
+  胶囊压在生成页面上方，和页面自身的标题/内容重复。改为只用 `ESP_LOGI`
+  打印 `menu page: <名称>`，屏幕直接呈现目标页；长按“返回主屏”提示保留，
+  因为它是离开菜单、没有目标页可看的动作。
+- 新增页面时无需再维护 toast 文案；串口日志仍可用于自动验收切页顺序。
+
+## 21. KEY3 切页卡死：不能把 SD/音频阻塞放进 app_core（2026-11-14）
+
+- 现象：连按 `key 3` 翻到第 7 页（音乐播放）时界面“卡死”数秒，期间其他按键
+  无响应；旧日志已有 `loop stall ... in music` 约 2s。
+- 根因不在 LVGL：所有菜单页在 `ui_init()` 已创建，`lv_screen_load_anim` 重叠调用
+  由 LVGL 9.5 处理，`auto_del=false` 也不会删除页面。真正问题在 `app_core`
+  主循环——它同时采样 KEY1/2/3 与触摸，却同步调用：
+  - 进入音乐页：`panda_mp3_scan()`（每个文件打开两次读 ID3，46 首约数百 ms）
+    + `panda_mp3_play()`（建解码/写任务）；
+  - 离开音乐页：`panda_mp3_stop()`（写端 abort 等 800ms，解码任务退出等 3s）。
+  主循环停摆即 UI 卡死，停顿中的短按还会丢失。
+- 规则：`app_core` 只做事件泵，任何可能阻塞数百 ms 以上的 SD/解码/网络操作都放到
+  独立任务。现由 `music_ctrl`（prio 3、300ms 轮询）负责音乐页副作用。
+- 顺带修的隐患：`s_done` 是二值信号量，超时停止会留下残留 token，让下一次
+  `stop()` 立刻“成功”而 worker 仍在跑；现在停止后清 token，且 `play()` 发现旧
+  worker 未退出时返回 `ESP_ERR_TIMEOUT`，避免两个 worker 共用 `s_stage`/环形缓冲。
+- 扫描本身也被配网页上传回调调用，`s_files/s_titles` 是全局表，必须用互斥锁串行化；
+  ID3 标题在排序后只读一遍（原先读两遍），扫描耗时约减半。
+- 观测：`menu page: <名称> (N ms)`、`music page entered (... scan N ms)`、
+  `mp3 play: ... (N ms)`、`music page left, playback stopped (N ms)`；
+  `status` 的 `max_gap` 若再次 >200ms，看 `loop stall` 的 stage 名定位。
+
+### 菜单页即时切换与页索引（同日真机复核后补）
+- `lv_screen_load_anim()` 的 `act_scr` 要到动画 start 回调才更新。若两次 KEY3
+  间隔小于一个 LVGL tick，第二次按 `lv_screen_active()` 判断会看到旧页，重复选同一
+  下一页（日志同一页名出现两次、实际少翻一页）。菜单内改为维护 `s_menu_index`，
+  仅在当前屏不是“索引所指的菜单页”时（回主屏/被其他页面接管）重新用屏幕反查。
+- 菜单页原先走 150/250ms 淡入。极速连按时多轮淡入重叠，显示锁被渲染长期占用，
+  按键处理曾排到 100–440ms；更极端时出现过两次整机静默（串口 0 字节、无 panic、
+  无新 coredump、重新复位才恢复），推测与屏幕动画/QSPI 刷新路径卡住有关，
+  但未抓到直接证据。菜单页现在用 `lv_screen_load()` 即时切换：处理耗时降到
+  0–22ms，70 次 120–450ms 连按全部按序、`max_gap` 保持启动基线。
+- 状态机页面（唤醒/聆听/思考/说话/错误/睡眠）仍保留淡入动画，不受影响。
+- 若再次遇到整机静默：先确认是否复位（`rst:` 原因、`status` 的 uptime），
+  保留原始串口日志；内置 USB-JTAG 的 OpenOCD 需要 udev 权限，当前用户
+  `libusb_open()` 报 `LIBUSB_ERROR_ACCESS`，调试前需补 udev 规则或提权。
+
+## 22. 真深睡：哪些东西能留下来（2026-11-14）
+
+- 深睡只保留 RTC 域；数字 GPIO、RMT、I2C、USB-JTAG 全断电。最直观的验证是
+  `/dev/ttyACM0` 消失——UI 睡眠不会让端口消失。
+- **唤醒源**：KEY1–3 与 TP_INT 都接在 TCA9555(P1.1/1.2/1.3、P0.2)，深睡时 I2C
+  不可用；板上也没有把 TCA9555 的 INT 引到 ESP32。可直接唤醒的只有 BOOT
+  (GPIO0, RTC GPIO)。触摸、语音唤醒在深睡下都不可用。
+- **呼吸灯**：WS2812 数据线是 GPIO38，不属于 RTC GPIO，深睡时无法翻转；
+  要“呼吸”只能浅睡轮询（约 1–3mA）或改硬件。当前方案是睡前锁存一颗极暗像素
+  `(3,8,4)`，再用 `gpio_hold_en(38)` + `gpio_deep_sleep_hold_en()` 把数据线
+  压低；灯保持颜色与否取决于灯带的 5V/3.3V 轨在深睡时是否仍供电。
+- **背光**：只把 LEDC 占空比设 0 不够——深睡后 GPIO5 悬空可能把背光拉亮。
+  必须先 `gpio_reset_pin` 脱离 LEDC，再输出低并 hold。
+- **唤醒后的 hold**：深睡唤醒是复位，hold 位会保留；`rgb_init()` /
+  `display_init()` 必须 `gpio_hold_dis()`，否则灯带数据或背光被永久钉住。
+- **LED 任务竞争**：睡眠态动画任务仍每 1s 写一帧黑屏，会覆盖睡前暗灯。
+  `panda_led_prepare_deep_sleep()` 先置 `s_frozen`，再用同一把输出互斥锁等待
+  在途帧结束后写指示灯，避免 1s 后又被清掉。
+- **BOOT 的 strapping 风险**：GPIO0 低电平是下载模式 strapping。深睡 `ext0`
+  唤醒也是复位，若按住跨过 ROM 采样点可能直接进下载模式（厂商豆包 demo
+  同样用 ext0 GPIO0，未给出规避）。所以睡前要等 BOOT 松开再 arm 唤醒；
+  唤醒动作建议“轻按一下”。2026-11-14 实测轻按 BOOT 正常唤醒
+  （`woke from deep sleep (cause=2, BOOT)`，完整冷启动，未进下载模式）；
+  按住跨过复位采样的边界未测，若复现：浅睡轮询、或把按键飞线到
+  GPIO2/17/18/21 等空闲 RTC GPIO 后改用 ext1。
+- **电流量级**：模块深睡约 10–20µA；一颗暗灯约 1–2mA（灯带静态电流 + 低占空
+  比），所以“留灯”会把待机电流抬高两个数量级。若要极低功耗，应把指示灯也关掉。
+- 深睡唤醒是冷启动（WiFi、语音、UI 全量初始化，约 1–2s），不是恢复原会话。
+
+## 23. SquareLine 手势与固件菜单轮转冲突（2026-11-14）
+
+- 生成的 37 屏里，菜单页各自绑了 `LV_EVENT_GESTURE` 固定跳转，例如
+  时间天气右滑回主屏、系统信息右滑回系统设置、快捷设置上滑回主屏；
+  这些顺序与固件 KEY3 的七页轮转（快捷→人格→睡眠→系统→设备信息→时间天气→音乐）
+  不一致，直接叠加会出现“左滑下一页、右滑又跳别处”的混乱。
+- 做法：`panda_ui_init()` 用 `lv_obj_remove_event_cb(scr, ui_event_xxx)` 摘掉
+  这六个生成回调（只含手势跳转，删除不影响按钮），再给七个菜单页统一挂
+  `menu_gesture_cb`：左滑 `menu_step(+1)`、右滑 `menu_step(-1)`、上滑回主屏。
+- LVGL 9.5 的手势分发不是“发给按下对象再逐级冒泡”，而是
+  `indev_gesture()` 从按下对象一路向上，只要当前对象带
+  `LV_OBJ_FLAG_GESTURE_BUBBLE` 就继续爬，最终把 `LV_EVENT_GESTURE` 发给
+  **第一个不带该 flag 的对象**（通常是屏幕）。注意 `lv_obj_create()` 默认给
+  所有有父节点的对象加这个 flag，只有屏幕（parent=NULL）默认没有。
+- 因此给屏幕对象本身加 `GESTURE_BUBBLE` 会让爬升越过屏幕到 NULL，事件直接丢失。
+  之前的 `add_gesture_bubble()` 把 flag 也加在屏幕/自建音乐页根节点上，
+  导致所有生成手势实际都收不到（本次已修：只给子对象补 flag，目标屏幕保持不带）。
+  子对象默认已带 flag，自建音乐页的按钮等子控件继承正常，从按钮上起滑也能切页。
+- 不要同时在 `app_core` 的 `handle_touch()` 里响应左右滑：`panda_touch` 自己
+  也以 45px 阈值发 `PANDA_TOUCH_SWIPE_*`，两套判定会各切一次页。
+- 回调运行在 LVGL 任务里，`panda_display_lock()` 是递归互斥，`menu_step()`
+  在事件中加锁安全；先 `lv_indev_wait_release()` 再换屏，避免抬手触发原页按钮。
+- 城市行放圆屏 y=144 时可视半宽约 `sqrt(180²-144²)=108px`。固定坐标对齐会被
+  不同长度的地名带偏，改用透明 flex 行（300×30，居中，`pad_column=6`），把
+  `ui_wx_icon`/`ui_wx_temp` reparent 进去，宽度改 `LV_SIZE_CONTENT`，地名变化时
+  LVGL 自动重新居中。SquareLine 字体的生僻地名回退到 16px CJK16，与 18px 温度
+  有轻微字号差。
+
+## 24. PSRAM 栈任务不能读写 NVS（2026-11-14）
+
+- 天气任务由 `xTaskCreatePinnedToCoreWithCaps(..., MALLOC_CAP_SPIRAM)` 创建，
+  栈在 PSRAM。若在该任务里调用 `nvs_set_*`/`nvs_commit`，NVS 读 flash 时
+  `spi_flash_disable_interrupts_caches_and_other_cpu()` 会关 cache，PSRAM 栈随即
+  不可访问，触发 `assert failed: esp_task_stack_is_sane_cache_disabled()`
+  并 coredump（实测天气取数成功后必崩）。
+- 规则：**PSRAM 栈任务只做 RAM/网络/LVGL 操作，NVS 写入交给内部栈任务**
+  （app_core、CLI、HTTP 任务）。本次中文地名缓存即由天气任务置
+  `s_label_pending`，app_core 每秒 `app_weather_take_city_label()` 消费并保存。
+- Open-Meteo geocoding：请求已带 `language=zh`，`results[0].name` 是本地化名
+  （Changzhou→“常州市”）；但用中文“常州”直接查询该 API 返回空结果，所以配置里
+  保留英文/拼音原文，另存中文显示名（NVS `wx_label`）供离线/重启使用。
+- LVGL `lv_obj_set_parent()` 可把生成页的图标/文字挂到自建容器里，flex 会接管
+  位置；`ui images` 的递归遍历仍能找到嵌套图片对象。
+
+## 25. 预览/表情/动画页为何“没用”及隐藏方式（2026-11-14）
+
+- 三页（角色预览 1/2、状态预览 3/3、表情管理、动画管理）来自 SquareLine 设计稿：
+  表情管理写死“19 个表情 · 已就绪 18”，动画管理写死“24 帧 · 12 FPS”，
+  行不可点，固件也没有序列帧动画管线（真实小动画只有思考三点、聆听/说话电平）。
+- 点缩略图“闪一下”的根因：状态定时器 50ms 一次（`panda_ui.c` 的
+  `lv_timer_create(state_timer_cb, 50, ...)`），`apply_view_locked()` 只在
+  “当前页是用户页或状态紧急”时保留画面。预览页在 `screen_is_user_page()` 里，
+  但点进去的表情/错误屏不在，所以下一 tick 立刻按真实状态拉回。
+- 这些页还绕过统一状态机直接 `_ui_screen_change` 到表情/断网/错误屏，
+  违反 PRD 6.2“禁止 UI 页面各自独立修改角色表情”。
+- 处理：保留屏幕对象（`ui images` 仍校验 37 屏），在 `create_menu_controls()`
+  用 `hide_widget()` 隐藏 `ui_link_prev/exp/anim` 三个入口。HIDDEN 父对象
+  同时屏蔽子对象命中测试，无需逐个删标签。
+- 后续若做“情绪驱动表情”（方案 C），需先把预览目标屏纳入用户页或在预览期间
+  暂停状态机收敛，再恢复入口；单纯把入口显示回来仍会被 50ms 拉回。
+
+## 26. 火山内联 TTS 情绪标签在实时端到端模型上不可用（2026-11-14）
+
+- 文档里 TTS 2.0/1.0 双向流式支持内联标签
+  `{{"audio_params":{"emotion":"happy","emotion_scale":5} }}`（注意是 3 个右括号），
+  标签应放在待朗读文本前。实测实时端到端模型 1.2.6.1（`settings` 里
+  `model=1.2.6.1`）**不把它当控制指令，而是当普通文本念出来**。
+- A/B 证据（同一问题、同一音色）：无标签 `tts done ... audio=5154ms/5974ms`；
+  标准三括号标签 `audio=10971ms/12550ms`，多出约 6s，正好是读出
+  `audio_params emotion happy emotion_scale` 的长度。控制点：把标签从人格指令
+  里去掉后时长立即回到 5–6s。
+- `response.output_text.done` 能收到模型输出的标签；但设备实收报文常缺内层
+  `}`（`{{"audio_params":{...}}` 只有两个右括号），`{body}` 包裹会解析失败，
+  需回退为 `{body}}` 再解析。即使修正格式，朗读问题依旧，所以不要在这条路上
+  继续投入，除非换模型/协议。
+- `output_text.done` 在 TTS 开始后约 3s 才到；若要在“说话中”尽早切表情，
+  需从 `response.output_text.delta` 的头部增量里解析并加只处理一次的标志。
+- 表情屏替换说话屏会被 50ms 状态定时器拉回：`screen_is_urgent()` 不够，
+  必须把 `s_view.voice == PANDA_STATE_VOICE_SPEAKING` 也算紧急，同时排除
+  `OFFLINE`/`RECONNECTING`（这两个仍要让断网提示优先）。
+- 语音回合中的表情不能被 `EMOTION_MS=2.5s` 清掉，`panda_state` 在
+  `VOICE_THINKING/SPEAKING/CANCELLING` 收到 EVT_EMOTION 时将寿命改为
+  `TURN_EMOTION_MS=60s`，回合结束（IDLE/LISTENING/PTT_DOWN）即清。
+
+## 27. O2.0 二进制实时语音协议实测要点（2026-11-14）
+
+- 端点 `wss://openspeech.bytedance.com/api/v3/realtime/dialogue`，头部需
+  `X-Api-App-ID`、`X-Api-Access-Key`、`X-Api-Resource-Id: volc.speech.dialog`、
+  `X-Api-App-Key`（厂商 demo 公开的固定常量，代码内做默认值，可被设置覆盖）、
+  `X-Api-Connect-Id`（随机）。`X-Api-App-Key` 是公开常量，不是用户密钥。
+- 帧：4 字节头 `(ver<<4|hdr_words) (msg<<4|flags) (serial<<4|comp) reserved`；
+  之后依次是可选的 seq（flags 含 0x01/0x02 时，**在 event 之前**）、event（flags
+  0x04）、服务端帧的 session-id（4B 长度 + 内容）、4B payload 长度、payload。
+  注意 `SERVER_ERROR` 的字节布局是 `code(4) + len(4) + msg`，且它的消息类型
+  在高 4 位（byte1 应为 `0xF0`，不是 `0x0F`）。
+- 客户端事件：1 StartConnection（无 sid）、100 StartSession（带 sid + JSON 配置）、
+  200 音频（`msg=0x02`、serial NONE、raw s16le 16k，带 sid）、102 FinishSession、
+  501 ChatTextQuery（`{"content":"..."}`）。客户端帧不压缩（comp=0）也能被接受。
+- 服务端事件：50 连接建立、150 会话建立、350 TTS 句首（`tts_type`）、352 TTS 音频
+  （`pcm_s16le` 24k，serial 常为 NONE；处理时不要依赖 serial，352 直接按音频）、
+  359 TTS 结束（`status_code`）、450 ASRInfo（打断信号）、451 ASRResponse
+  （`results[0].text` 是全量转写）、459 ASREnded、550 ChatResponse（`content`）、
+  559 ChatEnded、51/52/153/154 等。
+- O2 没有 commit：断句完全由服务端 VAD 决定（`end_smooth_window_ms=1500`），
+  客户端 `send_commit()` 在 O2 下属正常空操作。
+- 打断语义不同：JSON 链路有 `response.cancel`；O2 只能 `FinishSession`（102），
+  然后收到 152 再 `StartSession`（100）。重启会话期间的开头语音会丢，UI 应显示
+  CONNECTING。
+- WebSocket 分片：`esp_websocket_client` 的 `op_code` 0x2=二进制、0x1=文本、
+  0x0=续帧。**续帧不带类型**，必须记住首帧类型；否则 O2 下长 JSON 事件（>4KB）
+  的续帧会被送进二进制解析器。已在 `s_ws_binary_msg` 里跟踪。
+- gzip 解包：去掉 gzip 10 字节头及 FEXTRA/FNAME/FCOMMENT/FHCRC 后，喂 raw deflate
+  给 `tinfl_decompress_mem_to_mem(..., flags=0)`；zlib 流（`78 9c`）则带
+  `TINFL_FLAG_PARSE_ZLIB_HEADER`。厂商 demo 的 gzip 分支在 raw deflate 上又加了
+  zlib 标志，属于错误用法，别照抄。
+- 构建坑：`ESP_ERR_INVALID_DATA` 在 ESP-IDF 5.5 不存在，坏帧用
+  `ESP_ERR_INVALID_RESPONSE`。`panda_ai/build` 缓存里可能残留
+  `/tmp/sdkconfig.local.defaults`（上次会话为保留本机配置临时生成、已随 /tmp 清理）；
+  用 `idf.py -DSDKCONFIG_DEFAULTS=sdkconfig.defaults reconfigure` 重新生成，
+  实测 `sdkconfig` 前后零 diff，无需手改。
+
+## 28. 串口打开会复位开发板（2026-11-14）
+
+- 本板走 USB-Serial-JTAG（`/dev/ttyACM0`）。用 pyserial `Serial(...)` 打开时，
+  驱动默认拉高 DTR/RTS，即使紧接着置 False，EN 已被触发，设备会重启：
+  实测每次打开都能读到 `ESP-ROM:esp32s3-20210327` 与完整启动日志。
+- 自动化读写改用 termios 裸开，不碰调制解调器线：
+  `os.open(port, O_RDWR|O_NOCTTY|O_NONBLOCK)` + `tty.setraw` +
+  `tcsetattr` 设 B115200，之后 `os.read/os.write`。实测不再复位。
+- `idf.py flash` 本身会复位一次（预期）；验证日志时先等启动完成再发命令。
+- 增量构建后 `app_init: Compile time` 可能仍是旧时间戳（`esp_app_format` 未重编），
+  判断是否烧了新固件要看镜像段大小/`ELF SHA256`，不能只看编译时间。
+
+## 29. O2 真机联调：WS 栈溢出与 TTS 突发（2026-11-14）
+
+- **症状**：配好凭证、`api_mode=o2` 重启后，日志刚出现
+  `O2 connection started` 就打印
+  `***ERROR*** A stack overflow in task websocket_task has been detected.`
+  并 `RTC_SW_CPU_RST` 重启，随后每轮连接都复现。
+- **原因**：`send_session_create_o2()` 在 WS 事件回调里执行（即
+  `websocket_task`），函数内联了 `persona_plain[800] + persona[2200] +
+  config[4096] ≈ 7KB` 栈缓冲；WS 任务栈只配了 8192，TLS 握手后余量不够。
+  JSON 模式没暴露是因为 `session.create` 多在 PTT/app 任务里构建。
+- **修复**：三块缓冲改为 `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`，用完
+  `free`。注意不要“一块大分配再切三段”传给 `snprintf`，GCC 的
+  `-Werror=restrict` 会报参数与目标可能重叠；分成三次独立分配即可。
+  修完保持 WS 任务 8192 栈不变。
+- **TTS 突发**：O2 服务端按生成速度下发音频，不按实时。实测 258 字回复
+  `tts done ... audio=43434ms`，约 10s 内到齐，把 256K 样本（16k≈16s）的
+  环形缓冲打满，`ring full, dropped ...` 累计 293933 样本（约 18s）。
+  O2 音频帧是 24k，重采样到 16k 后写入环形缓冲；播放端只能实时消费。
+- **缓解**：`RING_SAMPLES` 提到 768K（1.5MB PSRAM，≈48s@16k）。PSRAM
+  余量约 6.9MB，代价可接受；普通短回复 `ring_drops=0`。更长的回复仍会丢尾，
+  根治需要给 WS 接收做背压（阻塞读取会牵连 ping/超时），暂不做。
+- **会话生命周期**：O2 每连接一次 `StartConnection`，连接建立后立即
+  `StartSession`；取消/打断 = `FinishSession`（服务端回 152）后按需重新
+  `StartSession`。`voice cancel` 不会自动重建，下一次 PTT 或 `voice clip`
+  才建；`voice clip` 现在会置 `s_clip_pending`，等 `O2 session started`
+  自动开始发送，便于自动化验证。O2 下没有 commit 事件，服务端 VAD
+  （`end_smooth_window_ms=1500`）决定断句。
+- **模型版本**：O2 的 `dialog.extra.model` 固定为 `1.2.1.1`（与厂商 demo 一致），
+  `settings set model` 只作用于 JSON 模式；改 O2 模型需改 `app_voice.c` 的
+  `O2_MODEL` 并确认控制台已开通对应端到端版本。
+
+## 30. 功放（PA）空闲噪声定位与门控（2026-11-14）
+
+- **症状**：TTS/MP3 播放时有明显“电流滋滋”声；不播放时喇叭也有轻微持续滋滋。
+- **分段实验**（串口临时加了 `audio pa on|off` 与 `audio mute on|off`，
+  屏幕上用 `ui status` 标 1–5 段，音量 40，用户盲听）：
+  1) PA 开 + DAC 开 → 有；2) PA 开 + DAC 静音 → 有；3) PA 关 + DAC 开 → **安静**；
+  4) PA 开 + DAC 开 → 有；5) 播放 880Hz 音调 → 有。
+  结论：噪声来自 PA 及其供电，不是 ES8311 DAC；DAC 静音也挡不住。
+- **修复**（`panda_audio.c`）：功放改为“按需供电”：
+  - `codecs_open()` 一律 PA 关 + DAC 静音；
+  - `panda_audio_play()` 遇到 `!s_out_on && !s_muted` 时先开 PA → 等 20ms →
+    解除 DAC 静音，再写第一块 PCM（只有首块付 20ms 延迟）；
+  - `panda_audio_poll()`（`app_core` 20ms 循环调用）在最后写入 800ms 后
+    先静音 DAC → 等 15ms → 关 PA；取 `s_tx_lock` 避免与写入/换采样率竞争；
+  - `panda_audio_mute(true)`（勿扰）立即执行同样的关断；
+  - `panda_audio_set_rate()` 在关闭 codec 前先关断，避免重配瞬间的咔哒。
+  DMA `auto_clear` 使 800ms 后数据早已是静音，门控不会截断有效音频。
+- **验证**：空闲 `audio status` → `out=off`（用户听感：完全安静）；
+  `audio tone 3` 期间 `out=on`，结束后 `out=off mute_reg=0x60`；
+  `voice clip` 全链路 `underruns=0 ring_drops=0`。构建 `0x8353d0`（18% free）。
+- **播放中残余噪声**：用户反馈“和之前差不多”，与第 2 段一致 —— 只要 PA 通电，
+  即使输入静音也有底噪，故播放时叠在语音上无法用软件消除；可尝试的硬件方向是
+  PA 供电去耦/滤波、降低 PA 固定增益或换低噪声功放。软件侧仅能缩短通电时间。
+- **诊断命令变更**：临时 `audio pa on|off` 已移除（PA 常开会被空闲轮询立即关闭，
+  保留会误导）；`audio status` 用 `out=on/off` 反映真实门控状态。
+
+## 31. 菜单切页“卡死”的显示锁看门狗（2026-11-14）
+
+- **现象**：KEY3 切页时卡在“时间天气”。串口侧特征很明确：`ui menu next` 无返回、
+  之后的 `status` 也不执行，但 `voice: uplink frames=... (silence)` 仍在打印
+  → 串口 CLI 任务卡在 `ui_lock()`，即 LVGL 显示递归锁被某个任务长期占用。
+  复位后连翻七页正常，说明是偶发竞态而非固定路径。
+- **两可根因**（新日志用于区分）：
+  1. 某任务持锁后阻塞在别的资源（如 LVGL 任务在回调里调用阻塞 API，或
+     `lv_indev_read` 持锁做 I2C）；
+  2. LVGL 任务自己卡在渲染/传输路径（例如 `esp_lcd_panel_io_tx_color` 的
+     事务队列满时错误被忽略，`on_color_trans_done` 永不触发，flush 永远
+     “在途”，屏幕静默冻结）。
+- **已加诊断/恢复**：
+  - `panda_display_lock_at(timeout, site)` 记录持锁任务名、`__func__` 位置、
+    持锁时长；获取超时与单次持锁 >500ms 打日志；`panda_display_lock_info()`
+    输出一行持有者信息。
+  - `panda_ui` 的 `ui_lock()`：先等 3s，失败打印
+    `display lock stuck 3s (caller=..., holder=..., site=..., held=..., lvgl ticks=N stopped Mms ago)`；
+    再等 7s，仍失败则 `vTaskDelay(100)` + `esp_restart()`（自恢复）。
+    注意：超时后绝不能“继续用锁”——递归信号量未持有却 `Give` 会破坏计数。
+  - LVGL 心跳：50ms 状态定时器里累加计数；`ticks` 停走且 holder=lvgl-task
+    说明 LVGL 任务死在回调/渲染里，否则看具体任务名。
+  - `esp_lcd_st77916.c` 的 `tx_color` 失败打 ERROR（原来返回值被丢弃）。
+- **压测结果**：`ui menu next` 连翻 100 次；next/prev/home 混合快速 300 次
+  （40–90ms，含音乐页自动起播/离页停止）→ 全部按序，无 stuck 日志。
+  观察到的正常等待上限约 260ms，来自 `panda_ui_is_music_page` 300ms 轮询
+  与 LVGL 渲染抢锁；>500ms 才会打提示，不要把它误判成卡死。
+- **复位原因**：`status` 新增 `reset : ...`。本板 USB-Serial-JTAG 的复位常报
+  `unknown`；若现场出现 `panic`/`task_wdt`/`brownout`，优先查对应路径。
+- **仍未坐实**：用户手指复现路径（KEY3 + 触摸手势）未抓到；下一步靠现场日志
+  里的 holder/site/lvgl ticks 三要素定性。
+
+## 32. 自动深睡与音乐播放（2026-11-14）
+
+- 规则：`panda_mp3_state()==PANDA_MP3_PLAYING` 时**不算空闲**。1Hz 逻辑里刷新
+  `s_last_active_us` 并跳过 `auto_sleep_s` 判定；否则播完一首（或刚好超过计时窗口）
+  停歌瞬间就会立即进深睡。
+- 预备期复检：自动休眠已排队时，到点执行前若正在播放则取消本次请求并清
+  `s_deep_sleep_at_us`（日志 `auto deep sleep deferred: music playing`）。
+  “菜单 → 立即休眠”是用户显式动作，不做该取消。
+- 实测：`auto_sleep_s=60` + 播放 75s 不休眠；排队后 1.5s 内起播可成功取消。
+  暂停（PAUSED）仍按空闲计时。

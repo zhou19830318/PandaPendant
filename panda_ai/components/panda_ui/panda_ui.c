@@ -7,6 +7,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "esp_app_desc.h"
 #include "lvgl.h"
 #include "qrcode.h"
@@ -31,6 +32,9 @@ static bool s_muted;
 static bool s_time_valid;
 static char s_status[96];
 static char s_subtitle[PANDA_STATE_SUBTITLE_MAX];
+/* Written from the lvgl task only; read by the display-lock watchdog. */
+static volatile uint32_t s_lvgl_ticks;
+static volatile int64_t s_lvgl_tick_us;
 
 static panda_ui_menu_hooks_t s_hooks;
 static int s_personality = 1;
@@ -43,6 +47,7 @@ static bool s_dnd;
 static uint32_t s_anim_ms = 150;
 static bool s_weather_valid;
 static int s_weather_temp;
+static char s_weather_city[32];
 static panda_ui_weather_t s_weather_icon = PANDA_UI_WEATHER_CLOUDY;
 static bool s_sd_mounted;
 static uint64_t s_sd_free_kb;
@@ -55,6 +60,8 @@ static lv_obj_t *s_status_box;
 static lv_obj_t *s_status_lbl;
 static lv_obj_t *s_subtitle_box;
 static lv_obj_t *s_subtitle_lbl;
+static lv_obj_t *s_wx_city;
+static lv_obj_t *s_wx_row;
 
 /* Subtitle window: two text lines. Longer replies scroll bottom-to-top so the
  * overlay never grows over the rest of the screen. */
@@ -94,19 +101,30 @@ static lv_obj_t *s_music_state_lbl;
 static lv_obj_t *s_music_index_lbl;
 static lv_obj_t *s_music_toggle_lbl;
 
-static void ui_lock(void)
+static void ui_lock_at(const char *site)
 {
     /* Wait for the LVGL task instead of timing out: the old 1 s timeout
      * returned without the lock and ui_unlock() then gave a semaphore we
-     * did not own, corrupting the display lock after a slow render. */
+     * did not own, corrupting the display lock after a slow render.
+     * A short timeout first keeps a dead holder from wedging every task
+     * forever: report once, retry, then reboot as last resort. */
     int64_t t0 = esp_timer_get_time();
-    if (!panda_display_lock(0)) {
-        ESP_LOGE(TAG, "display lock unavailable");
-        return;
+    if (!panda_display_lock_at(3000, site)) {
+        char info[96];
+        panda_display_lock_info(info, sizeof(info));
+        ESP_LOGE(TAG, "display lock stuck 3s (caller=%s): %s; lvgl ticks=%u stopped %lldms ago",
+                 site, info, (unsigned)s_lvgl_ticks,
+                 (long long)((esp_timer_get_time() - s_lvgl_tick_us) / 1000));
+        if (!panda_display_lock_at(7000, site)) {
+            panda_display_lock_info(info, sizeof(info));
+            ESP_LOGE(TAG, "display lock still stuck: %s; restarting", info);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        }
     }
     int64_t dt = esp_timer_get_time() - t0;
     if (dt > 150000) {
-        ESP_LOGW(TAG, "display lock wait %lld ms", (long long)(dt / 1000));
+        ESP_LOGW(TAG, "display lock wait %lld ms (%s)", (long long)(dt / 1000), site);
     }
 }
 
@@ -114,6 +132,8 @@ static void ui_unlock(void)
 {
     panda_display_unlock();
 }
+
+#define ui_lock() ui_lock_at(__func__)
 
 static void show_screen(lv_obj_t *scr)
 {
@@ -126,6 +146,18 @@ static void show_screen(lv_obj_t *scr)
         return;
     }
     lv_screen_load_anim(scr, LV_SCREEN_LOAD_ANIM_FADE_ON, ms, 0, false);
+}
+
+/* Menu pages are already built in ui_init() and the user asked to see the
+ * target page immediately. An instant load also clears any pending screen
+ * animation, so fast KEY3 presses never stack fades and hold the display
+ * lock long enough for the key handler to queue behind a render. */
+static void show_screen_instant(lv_obj_t *scr)
+{
+    if (scr == NULL || lv_screen_active() == scr) {
+        return;
+    }
+    lv_screen_load(scr);
 }
 
 static lv_obj_t *screen_for(panda_state_screen_t screen)
@@ -205,15 +237,21 @@ static bool screen_is_urgent(panda_state_screen_t screen)
     }
 }
 
+/* LVGL walks up from the pressed object while GESTURE_BUBBLE is set and
+ * sends LV_EVENT_GESTURE to the first object without it. Children already
+ * carry the flag by default; the screen is the intended receiver. Flagging
+ * the screen too would make the walk run past it into NULL and drop the
+ * gesture, so the target object is deliberately left unflagged. */
 static void add_gesture_bubble(lv_obj_t *obj)
 {
     if (obj == NULL) {
         return;
     }
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
     uint32_t count = lv_obj_get_child_count(obj);
     for (uint32_t i = 0; i < count; i++) {
-        add_gesture_bubble(lv_obj_get_child(obj, i));
+        lv_obj_t *child = lv_obj_get_child(obj, i);
+        lv_obj_add_flag(child, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        add_gesture_bubble(child);
     }
 }
 
@@ -658,22 +696,15 @@ static void update_brightness(void)
 static void update_wifi(void)
 {
     const char *text = "未连接";
-    const char *net = "未连接";
     if (s_wifi_ap) {
         text = "配网";
-        net = "配网中";
     } else if (s_wifi_connecting) {
         text = "连接中";
-        net = "连接中";
     } else if (s_wifi_connected) {
         text = "Wi-Fi";
-        net = "Wi-Fi 已连接";
     }
     if (ui_wifi_lbl != NULL) {
         lv_label_set_text(ui_wifi_lbl, text);
-    }
-    if (ui_net_v != NULL) {
-        lv_label_set_text(ui_net_v, net);
     }
     if (ui_wifi_on != NULL) {
         /* The blue overlay means "radio in use", not just "IP acquired";
@@ -710,6 +741,9 @@ static void update_weather(void)
     static const lv_image_dsc_t *const icons[] = {
         &ui_img_icon_sun_png, &ui_img_icon_cloud_sun_png, &ui_img_icon_cloud_off_png,
     };
+    if (s_wx_city != NULL) {
+        lv_label_set_text(s_wx_city, s_weather_city[0] != '\0' ? s_weather_city : "--");
+    }
     if (ui_wx_temp != NULL) {
         char buf[16];
         if (s_weather_valid) {
@@ -802,7 +836,8 @@ static void apply_menu_selection(void)
     apply_option_row(act_on, 3, s_animation);
     apply_option_row(auto_on, 4, s_auto_sleep_s == 60 ? 0 : s_auto_sleep_s == 300 ? 1
                                 : s_auto_sleep_s == 600 ? 2 : 3);
-    apply_option_row(wake_on, 3, s_wake_mode);
+    /* Deep sleep only wakes on BOOT (GPIO0); the touch/voice pills are hidden. */
+    apply_option_row(wake_on, 3, 0);
 
     if (ui_sw_anim_on != NULL) {
         if (s_sleep_anim) {
@@ -891,13 +926,9 @@ static void menu_click_cb(lv_event_t *e)
         panda_ui_toast(index == 3 ? "自动休眠已关闭" : "自动休眠已更新", 900);
         break;
     case MENU_GROUP_WAKE:
-        s_wake_mode = index;
+        s_wake_mode = 0;
         apply_menu_selection();
-        if (s_hooks.sleep_config) {
-            s_hooks.sleep_config(s_auto_sleep_s, s_wake_mode, s_sleep_anim);
-        }
-        panda_ui_toast(index == 1 ? "语音唤醒暂不支持，触摸仍可唤醒"
-                                 : "唤醒方式已保存", 1400);
+        panda_ui_toast("深睡仅支持 BOOT 键唤醒", 1400);
         break;
     case MENU_GROUP_SLEEP_ANIM:
         s_sleep_anim = !s_sleep_anim;
@@ -1031,9 +1062,46 @@ static void create_menu_controls(void)
     hide_widget(ui_bt_on);
     hide_widget(ui_bt_ic);
     hide_widget(ui_bt_lbl);
-    if (ui_bright_btn != NULL) lv_obj_set_x(ui_bright_btn, 0);
-    if (ui_bright_ic != NULL) lv_obj_set_x(ui_bright_ic, 0);
-    if (ui_bright_lbl != NULL) lv_obj_set_x(ui_bright_lbl, 0);
+
+    /* Brightness and volume would only repeat what the sliders on this page
+     * already show, so drop those quick tiles and lay the remaining three out
+     * on one row. */
+    hide_widget(ui_bright_btn);
+    hide_widget(ui_bright_ic);
+    hide_widget(ui_bright_lbl);
+    hide_widget(ui_vol_btn);
+    hide_widget(ui_vol_ic);
+    hide_widget(ui_vol_lbl);
+    lv_obj_t *quick_tiles[][4] = {
+        {ui_wifi_off, ui_wifi_on, ui_wifi_ic, ui_wifi_lbl},
+        {ui_dnd_off, ui_dnd_on, ui_dnd_ic, ui_dnd_lbl},
+        {ui_sleep_btn, NULL, ui_sleep_ic, ui_sleep_lbl},
+    };
+    static const int quick_x[] = {-86, 0, 86};
+    for (size_t i = 0; i < sizeof(quick_tiles) / sizeof(quick_tiles[0]); i++) {
+        for (int j = 0; j < 4; j++) {
+            if (quick_tiles[i][j] == NULL) {
+                continue;
+            }
+            lv_obj_set_x(quick_tiles[i][j], quick_x[i]);
+            lv_obj_set_y(quick_tiles[i][j], j == 3 ? 34 : -20);
+        }
+    }
+
+    /* Wi-Fi state already lives on the quick page; drop the duplicate 网络
+     * row here and move 时间同步 up into its slot. */
+    hide_widget(ui_net_k);
+    hide_widget(ui_net_v);
+    if (ui_tsync_k != NULL) lv_obj_set_y(ui_tsync_k, 24);
+    if (ui_tsync_v != NULL) lv_obj_set_y(ui_tsync_v, 24);
+
+    /* The SquareLine export links three demo pages from 设备信息. They show
+     * hard-coded counts and are not fed by the firmware; tapping a thumbnail
+     * is also undone by the 50 ms state reconcile. Keep the screens built for
+     * `ui images`, but hide the entries until emotion previews are real. */
+    hide_widget(ui_link_prev);
+    hide_widget(ui_link_exp);
+    hide_widget(ui_link_anim);
 
     lv_obj_t *pers_off[3] = {ui_pers_0_off, ui_pers_1_off, ui_pers_2_off};
     lv_obj_t *pers_on[3] = {ui_pers_0_on, ui_pers_1_on, ui_pers_2_on};
@@ -1128,7 +1196,11 @@ static void apply_view_locked(void)
     lv_obj_t *target = screen_for(s_view.screen);
     /* Voice reconnects and offline states must not yank the user out of a
      * menu page; the home screen still shows them as soon as it is loaded. */
-    bool urgent = screen_is_urgent(s_view.screen) &&
+    /* An emotion face replacing the speaking screen must stay as urgent as
+     * the speaking screen itself, or a voice turn would no longer surface
+     * while the user is on a settings page. */
+    bool urgent = (screen_is_urgent(s_view.screen) ||
+                   s_view.voice == PANDA_STATE_VOICE_SPEAKING) &&
                   s_view.screen != PANDA_STATE_SCREEN_OFFLINE &&
                   s_view.screen != PANDA_STATE_SCREEN_RECONNECTING;
     if (target != NULL && (!screen_is_user_page(lv_screen_active()) || urgent)) {
@@ -1167,6 +1239,8 @@ static void apply_view(void)
 static void state_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    s_lvgl_ticks++;
+    s_lvgl_tick_us = esp_timer_get_time();
     if (!s_ui_ready) {
         return;
     }
@@ -1327,6 +1401,119 @@ esp_err_t panda_ui_verify_images(panda_ui_image_report_t *report)
     return ctx.failures == 0 ? ESP_OK : ESP_FAIL;
 }
 
+/* KEY1-3 and touch sit behind the TCA9555 and cannot wake the ESP in deep
+ * sleep, so the sleep page shows the one wake key that is actually wired. */
+static void configure_sleep_wake_row(void)
+{
+    lv_obj_t *hidden[] = {ui_wake_1_off, ui_wake_1_on, ui_wake_1_t,
+                          ui_wake_2_off, ui_wake_2_on, ui_wake_2_t};
+    for (size_t i = 0; i < sizeof(hidden) / sizeof(hidden[0]); i++) {
+        if (hidden[i]) {
+            lv_obj_add_flag(hidden[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    lv_obj_t *pill[] = {ui_wake_0_off, ui_wake_0_on};
+    for (size_t i = 0; i < sizeof(pill) / sizeof(pill[0]); i++) {
+        if (pill[i]) {
+            lv_obj_set_width(pill[i], 120);
+            lv_obj_set_x(pill[i], 0);
+        }
+    }
+    if (ui_wake_lbl) {
+        lv_label_set_text(ui_wake_lbl, "唤醒键");
+    }
+    if (ui_wake_0_t) {
+        lv_obj_set_width(ui_wake_0_t, 120);
+        lv_obj_set_x(ui_wake_0_t, 0);
+        lv_label_set_text(ui_wake_0_t, "BOOT");
+    }
+}
+
+/* City · icon · temperature share one flex row so the group stays optically
+ * centred whatever the city string's width is (中文名 3–5 字，宽度不固定).
+ * The row is transparent and spans the safe area at y=144 (circle half-width
+ * there is ~108 px). */
+static void create_weather_row(void)
+{
+    if (ui_time_weather == NULL) {
+        return;
+    }
+    s_wx_row = lv_obj_create(ui_time_weather);
+    lv_obj_remove_style_all(s_wx_row);
+    lv_obj_set_size(s_wx_row, 300, 30);
+    lv_obj_set_align(s_wx_row, LV_ALIGN_CENTER);
+    lv_obj_set_y(s_wx_row, 144);
+    lv_obj_remove_flag(s_wx_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_wx_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(s_wx_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_wx_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_wx_row, 6, 0);
+
+    s_wx_city = lv_label_create(s_wx_row);
+    lv_obj_set_width(s_wx_city, LV_SIZE_CONTENT);
+    lv_label_set_text(s_wx_city, "--");
+    lv_obj_set_style_text_color(s_wx_city, lv_color_hex(0x8E9AB5), 0);
+    lv_obj_set_style_text_font(s_wx_city, &ui_font_CJK16, 0);
+
+    if (ui_wx_icon != NULL) {
+        lv_obj_set_parent(ui_wx_icon, s_wx_row);
+    }
+    if (ui_wx_temp != NULL) {
+        lv_obj_set_parent(ui_wx_temp, s_wx_row);
+        lv_obj_set_width(ui_wx_temp, LV_SIZE_CONTENT);
+        lv_obj_set_style_text_align(ui_wx_temp, LV_TEXT_ALIGN_CENTER, 0);
+    }
+}
+
+/* Menu pages page left/right with a swipe (left = next, right = previous).
+ * The SquareLine export wired a few of these pages to fixed targets, which
+ * fought the KEY3 rotation, so those callbacks are replaced here. Swipe up
+ * still leaves any menu page for home. */
+static void menu_gesture_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_GESTURE) {
+        return;
+    }
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL) {
+        return;
+    }
+    lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+        lv_indev_wait_release(indev);
+        if (dir == LV_DIR_LEFT) {
+            panda_ui_menu_next();
+        } else {
+            panda_ui_menu_prev();
+        }
+    } else if (dir == LV_DIR_TOP) {
+        lv_indev_wait_release(indev);
+        panda_ui_menu_home();
+    }
+}
+
+static void install_menu_gestures(void)
+{
+    lv_obj_t *screens[] = {
+        ui_quick_settings, ui_personality, ui_sleep_settings,
+        ui_system_settings, ui_system_info, ui_time_weather, s_music_screen,
+    };
+    lv_event_cb_t generated[] = {
+        ui_event_quick_settings, ui_event_personality, ui_event_sleep_settings,
+        ui_event_system_settings, ui_event_system_info, ui_event_time_weather, NULL,
+    };
+    for (size_t i = 0; i < sizeof(screens) / sizeof(screens[0]); i++) {
+        if (screens[i] == NULL) {
+            continue;
+        }
+        if (generated[i] != NULL) {
+            lv_obj_remove_event_cb(screens[i], generated[i]);
+        }
+        lv_obj_add_event_cb(screens[i], menu_gesture_cb, LV_EVENT_GESTURE, NULL);
+    }
+}
+
 esp_err_t panda_ui_init(void)
 {
     if (!panda_display_ready()) {
@@ -1334,10 +1521,15 @@ esp_err_t panda_ui_init(void)
         return ESP_ERR_INVALID_STATE;
     }
     panda_state_init(&s_state, lv_tick_get());
+    s_lvgl_tick_us = esp_timer_get_time();
     ui_lock();
     ui_init();
+    configure_sleep_wake_row();
     create_menu_controls();
+    create_weather_row();
     s_music_screen = create_music_screen();
+    install_menu_gestures();
+    add_gesture_bubble(s_music_screen);
     add_gesture_bubble(ui_home);
     add_gesture_bubble(ui_wakeup);
     add_gesture_bubble(ui_listening);
@@ -1635,6 +1827,17 @@ void panda_ui_set_weather(bool valid, int temp_c, panda_ui_weather_t icon)
     ui_unlock();
 }
 
+void panda_ui_set_weather_city(const char *city)
+{
+    snprintf(s_weather_city, sizeof(s_weather_city), "%s", city ? city : "");
+    if (!s_ui_ready) {
+        return;
+    }
+    ui_lock();
+    update_weather();
+    ui_unlock();
+}
+
 void panda_ui_set_menu_hooks(const panda_ui_menu_hooks_t *hooks)
 {
     if (hooks == NULL) {
@@ -1703,7 +1906,9 @@ bool panda_ui_is_home_screen(void)
     return home;
 }
 
-const char *panda_ui_menu_next(void)
+static int s_menu_index = -1;
+
+static const char *menu_step(int delta)
 {
     if (!s_ui_ready) {
         return NULL;
@@ -1720,16 +1925,40 @@ const char *panda_ui_menu_next(void)
 
     ui_lock();
     lv_obj_t *current = lv_screen_active();
-    int next = 0;
-    for (int i = 0; i < count; i++) {
-        if (screens[i] == current) {
-            next = (i + 1) % count;
-            break;
+    int index = -1;
+    if (s_menu_index >= 0 && s_menu_index < count && screens[s_menu_index] == current) {
+        /* lv_screen_active() still reports the old screen until the load
+         * animation's first timer tick, so deriving the index from it made a
+         * second press inside ~30 ms pick the same page again. */
+        index = s_menu_index;
+    } else {
+        for (int i = 0; i < count; i++) {
+            if (screens[i] == current) {
+                index = i;
+                break;
+            }
         }
     }
-    show_screen(screens[next]);
+    int next;
+    if (index >= 0) {
+        next = (index + delta + count) % count;
+    } else {
+        next = delta > 0 ? 0 : count - 1;
+    }
+    s_menu_index = next;
+    show_screen_instant(screens[next]);
     ui_unlock();
     return names[next];
+}
+
+const char *panda_ui_menu_next(void)
+{
+    return menu_step(1);
+}
+
+const char *panda_ui_menu_prev(void)
+{
+    return menu_step(-1);
 }
 
 void panda_ui_menu_home(void)
@@ -1738,7 +1967,7 @@ void panda_ui_menu_home(void)
         return;
     }
     ui_lock();
-    show_screen(ui_home);
+    show_screen_instant(ui_home);
     ui_unlock();
 }
 

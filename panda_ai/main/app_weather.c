@@ -35,6 +35,11 @@ typedef struct {
 
 static app_weather_info_t s_info;
 static SemaphoreHandle_t s_info_lock;
+/* The weather task's stack lives in PSRAM, so it must never touch NVS
+ * (flash writes disable the cache and PSRAM becomes unreachable). Hand the
+ * localized city name to app_core, which runs on an internal stack. */
+static char s_label_pending[PANDA_CITY_MAX];
+static bool s_label_dirty;
 static volatile bool s_refresh_req;
 static TaskHandle_t s_task;
 
@@ -142,7 +147,8 @@ static esp_err_t http_get(const char *url, char *buf, size_t cap, size_t *out_le
     return ESP_OK;
 }
 
-static bool parse_geocode(const char *json, double *lat, double *lon)
+static bool parse_geocode(const char *json, double *lat, double *lon,
+                          char *name, size_t name_len)
 {
     cJSON *root = cJSON_Parse(json);
     if (root == NULL) {
@@ -156,6 +162,10 @@ static bool parse_geocode(const char *json, double *lat, double *lon)
     if (cJSON_IsNumber(jlat) && cJSON_IsNumber(jlon)) {
         *lat = jlat->valuedouble;
         *lon = jlon->valuedouble;
+        cJSON *jname = cJSON_GetObjectItemCaseSensitive(first, "name");
+        if (cJSON_IsString(jname) && jname->valuestring != NULL) {
+            snprintf(name, name_len, "%s", jname->valuestring);
+        }
         ok = true;
     }
     cJSON_Delete(root);
@@ -183,7 +193,7 @@ static bool parse_current(const char *json, int *temp_c, int *code)
 
 static esp_err_t weather_fetch(void)
 {
-    const panda_settings_t *cfg = panda_settings_get();
+    panda_settings_t *cfg = panda_settings_get();
     if (cfg->weather_city[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
@@ -208,7 +218,8 @@ static esp_err_t weather_fetch(void)
     esp_err_t err = http_get(url, buf, WEATHER_BUF_CAP, NULL);
     double lat = 0;
     double lon = 0;
-    if (err != ESP_OK || !parse_geocode(buf, &lat, &lon)) {
+    char label[PANDA_CITY_MAX] = "";
+    if (err != ESP_OK || !parse_geocode(buf, &lat, &lon, label, sizeof(label))) {
         ESP_LOGW(TAG, "geocode '%s' failed", cfg->weather_city);
         heap_caps_free(buf);
         return ESP_FAIL;
@@ -235,14 +246,22 @@ static esp_err_t weather_fetch(void)
         .icon = wmo_icon(code),
         .updated = time(NULL),
     };
-    snprintf(info.city, sizeof(info.city), "%s", cfg->weather_city);
+    snprintf(info.city, sizeof(info.city), "%s", label[0] != '\0' ? label : cfg->weather_city);
     snprintf(info.condition, sizeof(info.condition), "%s", wmo_condition(code));
+
+    if (label[0] != '\0' && strcmp(cfg->weather_city_label, label) != 0) {
+        xSemaphoreTake(s_info_lock, portMAX_DELAY);
+        snprintf(s_label_pending, sizeof(s_label_pending), "%s", label);
+        s_label_dirty = true;
+        xSemaphoreGive(s_info_lock);
+    }
 
     xSemaphoreTake(s_info_lock, portMAX_DELAY);
     s_info = info;
     xSemaphoreGive(s_info_lock);
 
     panda_ui_set_weather(true, temp, info.icon);
+    panda_ui_set_weather_city(info.city);
     ESP_LOGI(TAG, "%s %d°C %s (code %d)", info.city, temp, info.condition, code);
     return ESP_OK;
 }
@@ -308,4 +327,20 @@ bool app_weather_get_info(app_weather_info_t *info)
     *info = s_info;
     xSemaphoreGive(s_info_lock);
     return info->valid;
+}
+
+bool app_weather_take_city_label(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0 || s_info_lock == NULL) {
+        return false;
+    }
+    bool dirty = false;
+    xSemaphoreTake(s_info_lock, portMAX_DELAY);
+    if (s_label_dirty) {
+        snprintf(out, cap, "%s", s_label_pending);
+        s_label_dirty = false;
+        dirty = true;
+    }
+    xSemaphoreGive(s_info_lock);
+    return dirty;
 }

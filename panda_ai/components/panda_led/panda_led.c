@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "panda_audio.h"
 #include "panda_board.h"
@@ -39,6 +40,8 @@ static volatile int s_batt_pct = -1;
 static volatile bool s_charging;
 static volatile bool s_batt_present;
 static volatile bool s_sleeping;
+static volatile bool s_frozen;
+static SemaphoreHandle_t s_out_lock;
 static uint8_t s_manual[3] = {255, 255, 255};
 
 static volatile uint32_t s_vol_ms;
@@ -346,7 +349,15 @@ static void led_task(void *arg)
                 render_events(px, t);
             }
         }
-        output_frame(px);
+        if (s_out_lock) {
+            xSemaphoreTake(s_out_lock, portMAX_DELAY);
+        }
+        if (!s_frozen) {
+            output_frame(px);
+        }
+        if (s_out_lock) {
+            xSemaphoreGive(s_out_lock);
+        }
 
         uint32_t period;
         if (s_sleeping || s_mode == PANDA_LED_MODE_OFF) {
@@ -375,6 +386,12 @@ esp_err_t panda_led_init(void)
     s_vol_ms = t - EVENT_VOLUME_MS;
     s_wake_ms = t - EVENT_WAKE_MS;
     s_net_ms = t - EVENT_NET_MS;
+    if (s_out_lock == NULL) {
+        s_out_lock = xSemaphoreCreateMutex();
+        if (s_out_lock == NULL) {
+            ESP_LOGW(TAG, "no output lock; deep sleep indicator may race");
+        }
+    }
     BaseType_t ok = xTaskCreatePinnedToCore(led_task, "panda_led", 3072, NULL, 2, NULL, 0);
     if (ok != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -450,6 +467,21 @@ void panda_led_set_battery(int percent, bool charging, bool present)
 void panda_led_set_sleeping(bool sleeping)
 {
     s_sleeping = sleeping;
+}
+
+esp_err_t panda_led_prepare_deep_sleep(void)
+{
+    s_frozen = true;
+    /* Wait for a frame that is already on the wire, then no tick can write
+     * again because every writer checks s_frozen under the same lock. */
+    if (s_out_lock) {
+        xSemaphoreTake(s_out_lock, portMAX_DELAY);
+    }
+    esp_err_t err = panda_board_rgb_sleep_indicator();
+    if (s_out_lock) {
+        xSemaphoreGive(s_out_lock);
+    }
+    return err;
 }
 
 void panda_led_notify_volume(int direction, int volume_percent)

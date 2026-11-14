@@ -623,6 +623,8 @@ static esp_err_t save_post(httpd_req_t *req)
 
     panda_settings_t *cfg = panda_settings_get();
     char value[PANDA_PERSONA_MAX + 1];
+    char prev_city[PANDA_CITY_MAX];
+    snprintf(prev_city, sizeof(prev_city), "%s", cfg->weather_city);
 
     if (form_get(body, "api_mode", value, sizeof(value))) {
         if (!strcmp(value, "o2") || !strcmp(value, "json")) {
@@ -652,6 +654,10 @@ static esp_err_t save_post(httpd_req_t *req)
         if (value[0] || !fields[i].secret) {
             copy_field(fields[i].dst, fields[i].cap, value);
         }
+    }
+
+    if (strcmp(prev_city, cfg->weather_city) != 0) {
+        cfg->weather_city_label[0] = '\0';
     }
 
     if (form_get(body, "volume", value, sizeof(value))) {

@@ -956,7 +956,12 @@ static esp_err_t panel_st77916_draw_bitmap(esp_lcd_panel_t *panel, int x_start, 
     }, 4), TAG, "send command failed");
     // transfer frame buffer
     size_t len = (x_end - x_start) * (y_end - y_start) * st77916->fb_bits_per_pixel / 8;
-    tx_color(st77916, io, LCD_CMD_RAMWR, color_data, len);
+    esp_err_t err = tx_color(st77916, io, LCD_CMD_RAMWR, color_data, len);
+    if (err != ESP_OK) {
+        /* A dropped colour transfer never fires on_color_trans_done, so the
+         * LVGL flush would stay "in flight" and the screen freezes silently. */
+        ESP_LOGE(TAG, "tx_color %u bytes failed: %s", (unsigned)len, esp_err_to_name(err));
+    }
 
     return ESP_OK;
 }

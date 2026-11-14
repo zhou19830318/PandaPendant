@@ -109,15 +109,17 @@ void panda_ui_set_brightness(int percent);
 void panda_ui_set_time(int year, int month, int day, int hour, int minute, int second, bool valid);
 void panda_ui_set_volume(int percent, bool muted);
 void panda_ui_set_weather(bool valid, int temp_c, panda_ui_weather_t icon);
+void panda_ui_set_weather_city(const char *city);
 
 void panda_ui_set_menu_hooks(const panda_ui_menu_hooks_t *hooks);
 void panda_ui_menu_sync(const panda_ui_menu_state_t *state);
 bool panda_ui_is_sleeping(void);
 bool panda_ui_is_home_screen(void);
 
-/* Hardware-key menu: advance through the generated setting pages and return
- * the page title (for a toast), or NULL when the UI is not ready. */
+/* Menu paging: next/previous wrap around the setting pages and return the
+ * page title (for a toast), or NULL when the UI is not ready. */
 const char *panda_ui_menu_next(void);
+const char *panda_ui_menu_prev(void);
 void panda_ui_menu_home(void);
 
 /* Provisioning QR overlay: joins the SoftAP in one scan. */

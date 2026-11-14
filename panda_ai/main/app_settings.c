@@ -34,6 +34,7 @@ static void set_defaults(panda_settings_t *c)
     c->sleep_anim = 1;
     c->dnd = 0;
     strcpy(c->weather_city, "北京");
+    c->weather_city_label[0] = '\0';
     snprintf(c->persona, sizeof(c->persona), "你是一只温柔、好奇、有点俏皮的熊猫伙伴。回答简短、口语化。");
 }
 
@@ -135,6 +136,7 @@ esp_err_t panda_settings_init(void)
     load_str(h, "speaker", s_cfg.speaker, sizeof(s_cfg.speaker));
     load_str(h, "persona", s_cfg.persona, sizeof(s_cfg.persona));
     load_str(h, "wx_city", s_cfg.weather_city, sizeof(s_cfg.weather_city));
+    load_str(h, "wx_label", s_cfg.weather_city_label, sizeof(s_cfg.weather_city_label));
     load_i32(h, "volume", &s_cfg.volume);
     load_i32(h, "brightness", &s_cfg.brightness);
     load_i32(h, "auto_cont", &s_cfg.auto_continue);
@@ -229,6 +231,7 @@ esp_err_t panda_settings_save(void)
     ESP_RETURN_ON_ERROR(PUT_STR("speaker", s_cfg.speaker), TAG, "speaker");
     ESP_RETURN_ON_ERROR(PUT_STR("persona", s_cfg.persona), TAG, "persona");
     ESP_RETURN_ON_ERROR(PUT_STR("wx_city", s_cfg.weather_city), TAG, "wx_city");
+    ESP_RETURN_ON_ERROR(PUT_STR("wx_label", s_cfg.weather_city_label), TAG, "wx_label");
     ESP_RETURN_ON_ERROR(PUT_I32("volume", s_cfg.volume), TAG, "volume");
     ESP_RETURN_ON_ERROR(PUT_I32("brightness", s_cfg.brightness), TAG, "brightness");
     ESP_RETURN_ON_ERROR(PUT_I32("auto_cont", s_cfg.auto_continue), TAG, "auto_cont");
@@ -285,7 +288,7 @@ void panda_settings_print(bool include_secrets)
     ESP_LOGI(TAG, "pers=%d feedback=%d animation=%d auto_sleep=%ds wake=%d sleep_anim=%d dnd=%d",
              c->personality, c->feedback, c->animation, c->auto_sleep_s,
              c->wake_mode, c->sleep_anim, c->dnd);
-    ESP_LOGI(TAG, "weather_city=%s", c->weather_city);
+    ESP_LOGI(TAG, "weather_city=%s label=%s", c->weather_city, c->weather_city_label);
     ESP_LOGI(TAG, "persona=%s", c->persona);
 }
 

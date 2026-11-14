@@ -78,6 +78,23 @@ static const char *join_args(int argc, char **argv, int start)
     return buf;
 }
 
+static const char *cli_reset_reason_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_EXT: return "ext";
+    case ESP_RST_SW: return "sw";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unknown";
+    }
+}
+
 static int cmd_status(int argc, char **argv)
 {
     (void)argc;
@@ -88,6 +105,7 @@ static int cmd_status(int argc, char **argv)
 
     printf("firmware : %s\n", "panda_ai");
     printf("uptime   : %" PRId64 " s\n", uptime_s);
+    printf("reset    : %s\n", cli_reset_reason_name(esp_reset_reason()));
     printf("voice    : %s\n", panda_ui_voice_state_name(panda_ui_get_voice_state()));
     printf("emotion  : %s\n", panda_ui_emotion_name(panda_ui_get_emotion()));
     if (info->battery_adc_ok) {
@@ -140,10 +158,31 @@ static int cmd_status(int argc, char **argv)
 static int cmd_ui(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("usage: ui state|emotion|error|device|screen|images|sleep|wake|status|subtitle|toast|audio|volume ...\n");
+        printf("usage: ui state|emotion|error|device|screen|images|menu next|prev|home|sleep [ui]|wake|status|subtitle|toast|audio|volume ...\n");
         return 1;
     }
 
+    if (!strcmp(argv[1], "menu") && argc >= 3) {
+        const char *page = NULL;
+        if (!strcmp(argv[2], "next")) {
+            page = panda_ui_menu_next();
+        } else if (!strcmp(argv[2], "prev")) {
+            page = panda_ui_menu_prev();
+        } else if (!strcmp(argv[2], "home")) {
+            panda_ui_menu_home();
+            printf("menu: home\n");
+            return 0;
+        } else {
+            printf("usage: ui menu next|prev|home\n");
+            return 1;
+        }
+        if (page == NULL) {
+            printf("UI not ready\n");
+            return 1;
+        }
+        printf("menu: %s\n", page);
+        return 0;
+    }
     if (!strcmp(argv[1], "screen")) {
         printf("screen: %s\n", panda_ui_current_screen());
         return 0;
@@ -161,8 +200,12 @@ static int cmd_ui(int argc, char **argv)
         return err == ESP_OK ? 0 : 1;
     }
     if (!strcmp(argv[1], "sleep")) {
-        panda_ui_sleep();
-        panda_led_set_sleeping(true);
+        if (argc >= 3 && !strcmp(argv[2], "ui")) {
+            panda_ui_sleep();
+            panda_led_set_sleeping(true);
+            return 0;
+        }
+        app_core_request_deep_sleep("cli");
         return 0;
     }
     if (!strcmp(argv[1], "wake")) {
@@ -259,7 +302,7 @@ static int cmd_ui(int argc, char **argv)
         return 0;
     }
 
-    printf("usage: ui state|emotion|error|device|screen|images|sleep|wake|status|subtitle|toast|audio|volume ...\n");
+    printf("usage: ui state|emotion|error|device|screen|images|sleep [ui]|wake|status|subtitle|toast|audio|volume ...\n");
     return 1;
 }
 
@@ -379,6 +422,7 @@ static int cmd_weather(int argc, char **argv)
         panda_settings_t *cfg = panda_settings_get();
         const char *city = join_args(argc, argv, 2);
         snprintf(cfg->weather_city, sizeof(cfg->weather_city), "%s", city);
+        cfg->weather_city_label[0] = '\0';
         esp_err_t err = panda_settings_save();
         app_core_settings_changed();
         app_weather_refresh();
@@ -598,6 +642,7 @@ static int cmd_settings(int argc, char **argv)
         cfg->dnd = iv;
     } else if (!strcmp(key, "weather_city")) {
         set_string(cfg->weather_city, sizeof(cfg->weather_city), value);
+        cfg->weather_city_label[0] = '\0';
     } else {
         printf("unknown key '%s'\n", key);
         return 1;
@@ -692,11 +737,18 @@ static int cmd_audio(int argc, char **argv)
         panda_audio_get_volume(&vol);
         panda_audio_get_codec_reg(0x31, &mute_reg);
         panda_audio_get_codec_reg(0x32, &dac_reg);
-        printf("ready=%d mic=%d rate=%u volume=%d mute_reg=0x%02x dac_reg=0x%02x\n",
+        printf("ready=%d mic=%d rate=%u volume=%d out=%s mute_reg=0x%02x dac_reg=0x%02x\n",
                panda_audio_ready(), panda_audio_has_mic(),
                (unsigned)panda_audio_get_rate(), vol,
+               panda_audio_output_on() ? "on" : "off",
                mute_reg < 0 ? 0xFF : mute_reg, dac_reg < 0 ? 0xFF : dac_reg);
         return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "mute")) {
+        bool on = !strcmp(argv[2], "on");
+        esp_err_t err = panda_audio_mute(on);
+        printf("audio mute %s: %s\n", on ? "on" : "off", esp_err_to_name(err));
+        return err == ESP_OK ? 0 : 1;
     }
     if (argc >= 2 && !strcmp(argv[1], "tone")) {
         int secs = 5;
@@ -724,7 +776,8 @@ static int cmd_audio(int argc, char **argv)
         printf("audio tone: %d s\n", secs);
         return 0;
     }
-    printf("usage: audio test | audio status | audio tone [seconds]\n");
+    printf("usage: audio test | audio status | audio tone [seconds] | "
+           "audio mute on|off\n");
     return 1;
 }
 
@@ -1047,7 +1100,7 @@ static int cmd_mp3(int argc, char **argv)
 
 static const esp_console_cmd_t s_commands[] = {
     {.command = "status", .help = "Show firmware, UI, battery and heap status", .func = cmd_status},
-    {.command = "ui", .help = "Control UI: ui state|emotion|error|device|screen|images|sleep|wake|status|subtitle|toast|audio|volume", .func = cmd_ui},
+    {.command = "ui", .help = "Control UI: ui state|emotion|error|device|screen|images|menu next|prev|home|sleep [ui]|wake|status|subtitle|toast|audio|volume", .func = cmd_ui},
     {.command = "touch", .help = "Inject gesture or probe panel: touch tap|double|long|left|right|up|down|diag", .func = cmd_touch},
     {.command = "key", .help = "Inject keys: key 1|2|3|boot [long]", .func = cmd_key},
     {.command = "brightness", .help = "Get/set display brightness 0..100", .func = cmd_brightness},
@@ -1057,7 +1110,7 @@ static const esp_console_cmd_t s_commands[] = {
     {.command = "settings", .help = "Show/save/reset/set NVS settings (secrets masked)", .func = cmd_settings},
     {.command = "weather", .help = "Weather: show | refresh | set <city>", .func = cmd_weather},
     {.command = "voice", .help = "Voice pipeline test: start, active, ptt down/up, clip, pump on/off, cancel", .func = cmd_voice},
-    {.command = "audio", .help = "Audio self-test: audio test", .func = cmd_audio},
+    {.command = "audio", .help = "Audio: test|status|tone [s]|mute on|off", .func = cmd_audio},
     {.command = "wifi", .help = "WiFi: status|scan|connect <ssid> [pass]|disconnect|forget|ap on/off|sync|recover", .func = cmd_wifi},
     {.command = "rgb", .help = "RGB LEDs: rgb status|mode|brightness | rgb <r> <g> <b> | rgb off", .func = cmd_rgb},
     {.command = "i2c", .help = "Scan the board I2C bus", .func = cmd_i2c},

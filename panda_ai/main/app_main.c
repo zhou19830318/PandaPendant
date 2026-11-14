@@ -3,6 +3,7 @@
 #include <time.h>
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_sleep.h"
 #include "nvs_flash.h"
 #include "app_core.h"
 #include "app_settings.h"
@@ -21,6 +22,13 @@ static const char *TAG = "main";
 void app_main(void)
 {
     ESP_LOGI(TAG, "Panda AI pendant booting");
+
+    esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+    if (wake == ESP_SLEEP_WAKEUP_EXT0 || wake == ESP_SLEEP_WAKEUP_EXT1) {
+        ESP_LOGW(TAG, "woke from deep sleep (cause=%d, BOOT)", (int)wake);
+    } else if (wake != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        ESP_LOGW(TAG, "woke from sleep (cause=%d)", (int)wake);
+    }
 
     setenv("TZ", "CST-8", 1);
     tzset();

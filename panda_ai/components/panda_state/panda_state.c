@@ -5,6 +5,10 @@
 
 #define WAKE_MS 1200u
 #define EMOTION_MS 2500u
+/* Emotion parsed from an answer tag must outlive a 2.5 s idle flash: the face
+ * is meant to carry the whole TTS turn, and the turn length is known only at
+ * playback idle. */
+#define TURN_EMOTION_MS 60000u
 #define ERROR_MS 4000u
 #define CONNECTING_MS 20000u
 #define LISTENING_MS 15000u
@@ -68,6 +72,26 @@ static panda_state_screen_t error_screen(panda_state_error_t error)
     }
 }
 
+static bool emotion_active(const panda_state_t *st)
+{
+    return st->emotion != PANDA_STATE_EMOTION_NEUTRAL &&
+           st->emotion_until != 0 && st->now_ms < st->emotion_until;
+}
+
+static panda_state_screen_t emotion_screen(const panda_state_t *st)
+{
+    switch (st->emotion) {
+    case PANDA_STATE_EMOTION_HAPPY: return PANDA_STATE_SCREEN_FACE_HAPPY;
+    case PANDA_STATE_EMOTION_CURIOUS: return PANDA_STATE_SCREEN_FACE_CURIOUS;
+    case PANDA_STATE_EMOTION_SURPRISED: return PANDA_STATE_SCREEN_FACE_SURPRISED;
+    case PANDA_STATE_EMOTION_SAD: return PANDA_STATE_SCREEN_FACE_SAD;
+    case PANDA_STATE_EMOTION_SHY: return PANDA_STATE_SCREEN_FACE_SHY;
+    case PANDA_STATE_EMOTION_SLEEPY: return PANDA_STATE_SCREEN_FACE_SLEEPY;
+    case PANDA_STATE_EMOTION_ANGRY: return PANDA_STATE_SCREEN_FACE_ANGRY;
+    default: return PANDA_STATE_SCREEN_IDLE;
+    }
+}
+
 static panda_state_screen_t resolve_screen(const panda_state_t *st)
 {
     if (!st->booted) {
@@ -96,24 +120,16 @@ static panda_state_screen_t resolve_screen(const panda_state_t *st)
     case PANDA_STATE_VOICE_THINKING:
         return PANDA_STATE_SCREEN_THINKING;
     case PANDA_STATE_VOICE_SPEAKING:
-        return PANDA_STATE_SCREEN_SPEAKING;
+        /* Keep the answer's face on screen while its audio plays; the subtitle
+         * is an overlay, so the pill still shows over the face. */
+        return emotion_active(st) ? emotion_screen(st) : PANDA_STATE_SCREEN_SPEAKING;
     case PANDA_STATE_VOICE_CANCELLING:
         return PANDA_STATE_SCREEN_LISTENING;
     default:
         break;
     }
-    if (st->emotion != PANDA_STATE_EMOTION_NEUTRAL &&
-        st->emotion_until != 0 && st->now_ms < st->emotion_until) {
-        switch (st->emotion) {
-        case PANDA_STATE_EMOTION_HAPPY: return PANDA_STATE_SCREEN_FACE_HAPPY;
-        case PANDA_STATE_EMOTION_CURIOUS: return PANDA_STATE_SCREEN_FACE_CURIOUS;
-        case PANDA_STATE_EMOTION_SURPRISED: return PANDA_STATE_SCREEN_FACE_SURPRISED;
-        case PANDA_STATE_EMOTION_SAD: return PANDA_STATE_SCREEN_FACE_SAD;
-        case PANDA_STATE_EMOTION_SHY: return PANDA_STATE_SCREEN_FACE_SHY;
-        case PANDA_STATE_EMOTION_SLEEPY: return PANDA_STATE_SCREEN_FACE_SLEEPY;
-        case PANDA_STATE_EMOTION_ANGRY: return PANDA_STATE_SCREEN_FACE_ANGRY;
-        default: break;
-        }
+    if (emotion_active(st)) {
+        return emotion_screen(st);
     }
     return PANDA_STATE_SCREEN_IDLE;
 }
@@ -228,6 +244,8 @@ void panda_state_dispatch(panda_state_t *st, const panda_state_event_t *ev, uint
         st->error_active = false;
         st->error = PANDA_STATE_ERROR_NONE;
         st->ptt_active = true;
+        st->emotion = PANDA_STATE_EMOTION_NEUTRAL;
+        st->emotion_until = 0;
         clear_subtitle(st);
         if (st->voice == PANDA_STATE_VOICE_DISCONNECTED ||
             st->voice == PANDA_STATE_VOICE_CONNECTING) {
@@ -290,6 +308,10 @@ void panda_state_dispatch(panda_state_t *st, const panda_state_event_t *ev, uint
         st->ptt_active = true;
         st->listening_until = now_ms + LISTENING_MS;
         st->connecting_until = 0;
+        /* A new turn starts from the listening face; the previous answer's
+         * emotion must not leak into it. */
+        st->emotion = PANDA_STATE_EMOTION_NEUTRAL;
+        st->emotion_until = 0;
         clear_subtitle(st);
         break;
 
@@ -322,6 +344,10 @@ void panda_state_dispatch(panda_state_t *st, const panda_state_event_t *ev, uint
         st->listening_until = 0;
         st->thinking_until = 0;
         st->cancelling_until = 0;
+        /* Turn end: the answer's face has done its job, return to the idle
+         * panda instead of holding the last emotion. */
+        st->emotion = PANDA_STATE_EMOTION_NEUTRAL;
+        st->emotion_until = 0;
         clear_subtitle(st);
         break;
 
@@ -329,10 +355,16 @@ void panda_state_dispatch(panda_state_t *st, const panda_state_event_t *ev, uint
         set_subtitle(st, ev->text);
         break;
 
-    case PANDA_STATE_EVT_EMOTION:
+    case PANDA_STATE_EVT_EMOTION: {
         st->emotion = (panda_state_emotion_t)ev->value;
-        st->emotion_until = now_ms + (ev->value == PANDA_STATE_EMOTION_NEUTRAL ? 0 : EMOTION_MS);
+        bool in_turn = st->voice == PANDA_STATE_VOICE_THINKING ||
+                       st->voice == PANDA_STATE_VOICE_SPEAKING ||
+                       st->voice == PANDA_STATE_VOICE_CANCELLING;
+        st->emotion_until = (st->emotion == PANDA_STATE_EMOTION_NEUTRAL)
+                                ? 0
+                                : now_ms + (in_turn ? TURN_EMOTION_MS : EMOTION_MS);
         break;
+    }
 
     case PANDA_STATE_EVT_WIFI:
         st->wifi_connected = ev->flag;

@@ -70,6 +70,9 @@ bool panda_board_rgb_ready(void);
 esp_err_t panda_board_rgb_set(uint8_t r, uint8_t g, uint8_t b);
 esp_err_t panda_board_rgb_write(const uint8_t *rgb, int count);
 esp_err_t panda_board_rgb_off(void);
+/* Latch one very dim pixel and hold the data line low for deep sleep; the
+ * ring keeps that colour only while its power rail stays up. */
+esp_err_t panda_board_rgb_sleep_indicator(void);
 
 /* Diagnostics */
 void panda_board_print_info(void);

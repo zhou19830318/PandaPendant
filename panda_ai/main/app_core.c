@@ -1,6 +1,7 @@
 #include "app_core.h"
 #include "app_provisioning.h"
 #include "app_settings.h"
+#include "app_weather.h"
 #include "panda_audio.h"
 #include "panda_board.h"
 #include "panda_connectivity.h"
@@ -17,6 +18,8 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "esp_timer.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -87,6 +90,8 @@ static bool s_touch_moved;
 static int s_ptt_source; /* 0 none, 2 touch */
 static int64_t s_last_active_us;
 static bool s_music_page_on;
+static volatile int64_t s_deep_sleep_at_us;
+static const char *s_deep_sleep_reason = "?";
 
 static void touch_activity(void)
 {
@@ -104,6 +109,48 @@ static bool wake_if_sleeping(void)
     touch_activity();
     ESP_LOGI(TAG, "wake by input");
     return true;
+}
+
+void app_core_request_deep_sleep(const char *reason)
+{
+    if (s_deep_sleep_at_us != 0) {
+        return;
+    }
+    s_deep_sleep_reason = reason ? reason : "request";
+    s_deep_sleep_at_us = esp_timer_get_time() + 1500 * 1000;
+    ESP_LOGW(TAG, "deep sleep requested (%s), 1.5s preview", s_deep_sleep_reason);
+    if (panda_ui_get_voice_state() != PANDA_VOICE_IDLE) {
+        app_voice_cancel();
+    }
+    panda_ui_sleep();
+    panda_led_set_sleeping(true);
+}
+
+static void enter_deep_sleep(void)
+{
+    ESP_LOGW(TAG, "shutting down for deep sleep (%s)", s_deep_sleep_reason);
+    app_provisioning_stop();
+    panda_connectivity_ap(false);
+    panda_connectivity_disconnect();
+    app_voice_cancel();
+    panda_mp3_stop();
+    panda_board_pa_enable(false);
+    panda_settings_save();
+    if (panda_board_sdcard_mounted()) {
+        panda_board_sdcard_unmount();
+    }
+    panda_display_prepare_deep_sleep();
+    if (panda_led_prepare_deep_sleep() != ESP_OK) {
+        ESP_LOGW(TAG, "sleep indicator unavailable");
+    }
+    /* Never arm a wake pin that is still being held by this press. */
+    for (int i = 0; i < 100 && panda_board_boot_pressed(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    ESP_LOGW(TAG, "deep sleep now (wake: BOOT/GPIO0 low)");
+    esp_deep_sleep_start();
 }
 
 __attribute__((weak)) esp_err_t app_audio_test_start(void)
@@ -228,12 +275,7 @@ static void menu_sleep_config_hook(int auto_sleep_s, int wake_mode, bool sleep_a
 
 static void menu_sleep_now_hook(void)
 {
-    if (panda_ui_get_voice_state() != PANDA_VOICE_IDLE) {
-        app_voice_cancel();
-    }
-    panda_ui_sleep();
-    panda_led_set_sleeping(true);
-    ESP_LOGI(TAG, "sleep requested from menu");
+    app_core_request_deep_sleep("menu");
 }
 
 static void menu_wifi_hook(bool enable)
@@ -310,42 +352,61 @@ static void music_page_refresh(void)
     panda_ui_set_music(title, playing, idx, count);
 }
 
-static void music_page_sync(void)
+/* Menu paging must never wait for the SD card. Scanning reads the ID3 tag of
+ * every file and stopping drains the decoder/DMA; both used to run inside
+ * app_core, which also samples keys and touch, so cycling KEY3 across the
+ * music page looked like a freeze for seconds. Keep it in a lower priority
+ * task and leave app_core responsive. */
+static void music_ctrl_task(void *arg)
 {
-    bool on = panda_ui_is_music_page();
-    if (on && !s_music_page_on) {
-        if (app_voice_is_active()) {
-            app_voice_cancel();
-        }
-        int count = panda_mp3_scan();
-        ESP_LOGI(TAG, "music page entered (%d track(s) in %s)", count, panda_mp3_dir());
-        if (count <= 0) {
-            panda_ui_set_music("无歌曲", false, -1, 0);
-            panda_ui_toast("SD 卡 Music 文件夹没有 MP3", 2000);
-        } else {
-            esp_err_t err = panda_mp3_play(-1);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "mp3 play failed: %s", esp_err_to_name(err));
-                panda_ui_toast("MP3 播放失败", 1600);
+    (void)arg;
+    while (true) {
+        bool on = panda_ui_is_music_page();
+        if (on && !s_music_page_on) {
+            if (app_voice_is_active()) {
+                app_voice_cancel();
             }
+            panda_ui_set_music("扫描中", false, -1, 0);
+            int64_t t0 = esp_timer_get_time();
+            int count = panda_mp3_scan();
+            ESP_LOGI(TAG, "music page entered (%d track(s) in %s, scan %lld ms)",
+                     count, panda_mp3_dir(),
+                     (long long)((esp_timer_get_time() - t0) / 1000));
+            if (count <= 0) {
+                panda_ui_set_music("无歌曲", false, -1, 0);
+                panda_ui_toast("SD 卡 Music 文件夹没有 MP3", 2000);
+            } else if (!panda_ui_is_music_page()) {
+                ESP_LOGI(TAG, "music page left during scan; playback not started");
+            } else {
+                t0 = esp_timer_get_time();
+                esp_err_t err = panda_mp3_play(-1);
+                ESP_LOGI(TAG, "mp3 play: %s (%lld ms)", esp_err_to_name(err),
+                         (long long)((esp_timer_get_time() - t0) / 1000));
+                if (err != ESP_OK) {
+                    panda_ui_toast("MP3 播放失败", 1600);
+                }
+            }
+            s_music_shown_idx = -2;
+        } else if (!on && s_music_page_on) {
+            int64_t t0 = esp_timer_get_time();
+            panda_mp3_stop();
+            ESP_LOGI(TAG, "music page left, playback stopped (%lld ms)",
+                     (long long)((esp_timer_get_time() - t0) / 1000));
+            s_music_shown_idx = -2;
         }
-        s_music_shown_idx = -2;
-    } else if (!on && s_music_page_on) {
-        panda_mp3_stop();
-        ESP_LOGI(TAG, "music page left, playback stopped and resources released");
-        s_music_shown_idx = -2;
+        s_music_page_on = on;
+        if (on) {
+            music_page_refresh();
+        }
+        panda_led_play_t play = PANDA_LED_PLAY_IDLE;
+        switch (panda_mp3_state()) {
+        case PANDA_MP3_PLAYING: play = PANDA_LED_PLAY_PLAYING; break;
+        case PANDA_MP3_PAUSED: play = PANDA_LED_PLAY_PAUSED; break;
+        default: break;
+        }
+        panda_led_set_play(play, panda_mp3_current());
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
-    s_music_page_on = on;
-    if (on) {
-        music_page_refresh();
-    }
-    panda_led_play_t play = PANDA_LED_PLAY_IDLE;
-    switch (panda_mp3_state()) {
-    case PANDA_MP3_PLAYING: play = PANDA_LED_PLAY_PLAYING; break;
-    case PANDA_MP3_PAUSED: play = PANDA_LED_PLAY_PAUSED; break;
-    default: break;
-    }
-    panda_led_set_play(play, panda_mp3_current());
 }
 
 static void provisioning_qr_sync(void)
@@ -411,6 +472,8 @@ void app_core_settings_changed(void)
     panda_audio_mute(cfg->dnd != 0);
     panda_ui_set_volume(cfg->volume, cfg->volume == 0);
     panda_ui_set_brightness(cfg->brightness);
+    panda_ui_set_weather_city(cfg->weather_city_label[0] != '\0' ? cfg->weather_city_label
+                                                                 : cfg->weather_city);
     sync_menu_state();
 }
 
@@ -454,10 +517,11 @@ void app_core_key_action(int button, bool is_long)
             panda_ui_toast("返回主屏", 800);
             ESP_LOGI(TAG, "menu page: home");
         } else {
+            int64_t t0 = esp_timer_get_time();
             const char *page = panda_ui_menu_next();
             if (page != NULL) {
-                panda_ui_toast(page, 800);
-                ESP_LOGI(TAG, "menu page: %s", page);
+                ESP_LOGI(TAG, "menu page: %s (%lld ms)", page,
+                         (long long)((esp_timer_get_time() - t0) / 1000));
             }
         }
         break;
@@ -514,7 +578,7 @@ static void app_core_task(void *arg)
     int64_t next_heap = 0;
     int64_t next_sync = 0;
     int64_t next_prov = 0;
-    int64_t next_music = 0;
+    int64_t next_wx_label = 0;
 
     app_core_set_wifi_status(false, false, true);
     panda_ui_set_voice_state(PANDA_VOICE_CONNECTING);
@@ -541,7 +605,19 @@ static void app_core_task(void *arg)
 
         s_loop_stage = "keys";
         panda_board_buttons_scan();
+        panda_audio_poll();
         int64_t now = esp_timer_get_time();
+
+        if (s_deep_sleep_at_us != 0 && now >= s_deep_sleep_at_us) {
+            if (strcmp(s_deep_sleep_reason, "auto") == 0 &&
+                panda_mp3_state() == PANDA_MP3_PLAYING) {
+                ESP_LOGI(TAG, "auto deep sleep deferred: music playing");
+                s_deep_sleep_at_us = 0;
+            } else {
+                s_loop_stage = "deep-sleep";
+                enter_deep_sleep();
+            }
+        }
 
         for (int i = 0; i < 4; i++) {
             bool pressed = panda_board_button_pressed((panda_button_t)i);
@@ -657,12 +733,6 @@ static void app_core_task(void *arg)
             }
         }
 
-        if (now >= next_music) {
-            s_loop_stage = "music";
-            next_music = now + 300000;
-            music_page_sync();
-        }
-
         if (s_ui_pending_lock) {
             s_loop_stage = "voice-ui";
             bool have_voice = false;
@@ -723,11 +793,18 @@ static void app_core_task(void *arg)
             const panda_settings_t *cfg = panda_settings_get();
             panda_voice_ui_t voice = panda_ui_get_voice_state();
             bool voice_idle = voice == PANDA_VOICE_IDLE || voice == PANDA_VOICE_OFFLINE;
-            if (cfg->auto_sleep_s > 0 && !panda_ui_is_sleeping() && voice_idle &&
+            /* A track that plays for longer than auto_sleep_s must not look
+             * idle: refresh the timer while it runs, otherwise the device
+             * would deep-sleep the moment playback stops. */
+            bool music_playing = panda_mp3_state() == PANDA_MP3_PLAYING;
+            if (music_playing) {
+                touch_activity();
+            }
+            if (cfg->auto_sleep_s > 0 && !panda_ui_is_sleeping() && voice_idle && !music_playing &&
+                s_deep_sleep_at_us == 0 &&
                 (now - s_last_active_us) >= (int64_t)cfg->auto_sleep_s * 1000000) {
-                panda_ui_sleep();
-                panda_led_set_sleeping(true);
                 ESP_LOGI(TAG, "auto sleep after %ds idle", cfg->auto_sleep_s);
+                app_core_request_deep_sleep("auto");
             }
 
             /* Do not rely on the AP edge event alone: it is enqueued from the
@@ -757,6 +834,20 @@ static void app_core_task(void *arg)
             s_loop_stage = "menu-sync";
             next_sync = now + 60000000;
             sync_menu_state();
+        }
+
+        if (now >= next_wx_label) {
+            s_loop_stage = "wx-label";
+            next_wx_label = now + 1000000;
+            char label[PANDA_CITY_MAX];
+            if (app_weather_take_city_label(label, sizeof(label))) {
+                panda_settings_t *cfg = panda_settings_get();
+                if (strcmp(cfg->weather_city_label, label) != 0) {
+                    snprintf(cfg->weather_city_label, sizeof(cfg->weather_city_label), "%s", label);
+                    ESP_LOGI(TAG, "weather city label cached: %s", label);
+                    panda_settings_save();
+                }
+            }
         }
 
         if (now >= next_batt) {
@@ -831,6 +922,10 @@ esp_err_t app_core_start(void)
     panda_mp3_init();
     panda_led_init();
     BaseType_t ok = xTaskCreatePinnedToCore(app_core_task, "app_core", 6 * 1024, NULL, 5, NULL, 1);
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    ok = xTaskCreatePinnedToCore(music_ctrl_task, "music_ctrl", 5 * 1024, NULL, 3, NULL, 1);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 

@@ -13,15 +13,16 @@
 - [x] 已完成并有验证证据
 - [!] 阻塞
 
-## 当前构建状态（2026-11-13）
+## 当前构建状态（2026-11-14）
 
-- `idf.py build` 通过：`panda_ai.bin` 0x82f350（约 8.20MB），factory 10MB 剩余 18%
-  （0x1d0cb0）；`project(panda_ai VERSION 2.0.0)`；已烧录 `/dev/ttyACM0`。
+- `idf.py build` 通过：`panda_ai.bin` 0x835dd0（约 8.21MiB），factory 10MB 剩余 18%
+  （0x1ca230）；`project(panda_ai VERSION 2.0.0)`；已烧录 `/dev/ttyACM0`。
 - 新增 `CONFIG_LV_FONT_MONTSERRAT_48=y`（`sdkconfig.defaults`）供音乐页 48px 图标，
   bin 因此增加约 96KB。
 - 配网页按需运行：SoftAP 或 STA 任一联网时启动，网络全断时停止；STA 在线可直接
   访问 `http://<设备IP>/`，也可 `wifi ap on` 后访问 `192.168.4.1`。
 - 串口 CLI 已接入：status/ui/touch/brightness/volume/battery/time/settings/voice/audio/weather/rgb/i2c/sdcard/rtc/wifi/heap/reboot；
+  `status` 现包含 `reset : poweron|sw|panic|int_wdt|task_wdt|wdt|brownout|deepsleep|unknown`；
   `ui error asr|llm|tts|audio|network|auth|generic|clear` 可注入/清除错误屏；
   `ui images` 可无屏检查 37 屏的图片解码（37 屏/71 对象/58 唯一/0 失败）；
   `voice stats` 输出 WS/TTS 计数器，`wifi status` 增加 `ap_auto`/`reason`/`retry`；
@@ -29,6 +30,217 @@
   `audio tone [seconds]` 连续 880Hz 音；`voice pump on|off` 开关上行静音泵（诊断用）；
   `mp3 status|list|play [index]|toggle|next|prev|stop`，`mp3 status` 额外输出
   `audio_rate/underruns/buffered/flags`（flags：bit0 primed、bit1 eof、bit2 idle、bit3 abort）。
+
+## 本轮：音乐播放期间不自动深睡（2026-11-14，已烧录/已验证）
+
+- 需求：播放音乐时设备不算空闲，不应进入自动深睡。
+- [x] `app_core` 1Hz 逻辑：`panda_mp3_state()==PLAYING` 时刷新 `s_last_active_us`
+  并跳过自动休眠判定，避免“放完一首正好超时立刻睡”。
+- [x] 已排队的自动休眠在 1.5s 预备期到点时若检测到音乐播放则取消
+  （`auto deep sleep deferred: music playing`）；`menu` 立即休眠不受影响。
+- [x] 构建 `0x835dd0`（18% free），已烧录。
+- [x] 验证 1：`settings set auto_sleep_s 60` + `mp3 play 1`，连续播放 75s，
+  `uptime 75 s` 仍在运行，无 `auto sleep`/深睡日志；随后恢复 300s 并停止。
+- [x] 验证 2：空闲等满 60s 触发 `auto sleep after 60s idle` + 1.5s 预备，
+  期间 `mp3 play 1` → 日志 `auto deep sleep deferred: music playing`，
+  设备继续运行（`uptime 162 s`）。
+
+## 本轮：菜单切页卡死诊断与自恢复（2026-11-14，已烧录/待复现）
+
+- 用户现象：多功能键（KEY3）切页时卡在“时间天气”，屏幕与按键无响应。
+- 串口复核：卡死时 `ui menu next` 无返回、后续 `status` 不执行，而
+  `voice: uplink ... (silence)` 持续打印 → 串口 CLI 阻塞在 `ui_lock`（显示递归锁
+  被某任务长期占用）。复位后连翻七页正常，非确定性。
+- [x] `panda_display` 增加持锁追踪：`panda_display_lock_at(timeout, site)` 记录
+  任务/位置/时长；超时与单次持锁 >500ms 打日志；`panda_display_lock_info()` 可查。
+- [x] `panda_ui` 看门狗：3s 拿不到锁打印 `display lock stuck 3s (caller=...):
+  holder=... site=... held=...ms; lvgl ticks=N stopped Mms ago`；再等 7s 仍失败
+  则 `esp_restart()` 自恢复；50ms 状态定时器维护 LVGL 心跳计数。
+- [x] `esp_lcd_st77916.c`：`tx_color` 返回值不再忽略，失败打 ERROR（丢一次颜色
+  传输会让 flush 永不完成、屏幕静默冻结）。
+- [x] `status` 增加 `reset : ...`，用于判断卡死是否伴随复位。
+- [x] 构建 `0x835d30`（18% free），已烧录。
+- [x] 压测：`ui menu next` 连翻 100 次；混合 next/prev/home 快速 300 次
+  （40–90ms，含音乐页自动起播/离页停止）→ 无卡死；最长锁等待 262ms
+  （`panda_ui_is_music_page` 300ms 轮询，属正常）；无 `stuck`/`tx_color failed`。
+- [x] `key 3` 注入真实按键处理路径 140 次（30–120ms 连击，混短按/长按回主屏/
+  音量键）：页面按序循环，短按处理最长 8ms（混合含音乐页 106ms），无 `stuck`。
+- [~] 根因定位：待用户按 KEY3 复现并保留串口日志。判断规则：
+  `holder=lvgl-task` 且 `lvgl ticks` 停走 → 查 LVGL 回调/QSPI flush；
+  `holder=<任务名> site=<panda_ui 函数>` → 查该函数持锁期间的阻塞调用。
+- [~] 触摸幻触复查：早前一次 `status` 见 `gestures=8 taps=0`，但静置 10s 复查
+  `gestures=0` 且无新增，暂不作为结论；若复现日志出现无人工操作的
+  `touch action swipe_*`，再查 CST816S 坐标抖动与 45px 阈值。
+
+## 本轮：C 阶段情绪标签探针（2026-11-14，已回退/结论不可用）
+
+- 目标：LLM 回复带火山内联 TTS 标签 `{{"audio_params":{"emotion":"happy",...} }}`，
+  `output_text.done` 解析后映射到 `panda_emotion_t` 并切表情屏。
+- [~] 标签能收到：设备实收为两括号（缺内层 `}`），解析器已做兼容；host 测试 8/8。
+- [!] 端到端实时模型（1.2.6.1）把标签当普通文本朗读：同一问题 A/B，
+  无标签 `audio=5154/5974ms`，标准三括号标签 `audio=10971/12550ms`。
+  → 标签方案不能上线，相关指令与解析代码已移除。
+- [x] 回退后构建 `0x832910`（18% free），烧录验证 `audio=5385ms`，回复无标签。
+- [x] 保留 C2 状态机能力并验证：`panda_state` 增加 `TURN_EMOTION_MS=60s`
+  （语音回合中设置的表情不按 2.5s 过期），`VOICE_SPEAKING` 时表情屏优先；
+  `panda_ui` 紧急判定包含 `VOICE_SPEAKING`。真机说话中 `ui emotion happy` →
+  `screen speaking -> face_happy`，字幕保持，播放结束回 idle。
+- [ ] 正式情绪通道：等待 O2.0 二进制协议或服务端 `emotion` 事件（唯一可靠来源）；
+  在此之前 C 阶段暂停，先做现有 `[~]` 项的目视验收。
+
+## 本轮：隐藏设备信息页三个演示入口（2026-11-14，已烧录/待目视）
+
+- 决策：先走 B（隐藏入口），后续再走 C（情绪驱动表情）。调研结论见
+  `tech_notes.md` 第 25 节：三页是 SquareLine 演示页，数据写死且点预览会被
+  50ms 状态收敛拉回。
+- [x] `panda_ui.c` 的 `create_menu_controls()` 隐藏 `ui_link_prev/exp/anim`；
+  屏幕对象保留，便于 `ui images` 继续校验 37 屏，后续做真实预览时可复用。
+- [x] 构建：`idf.py build` → 0x8327f0，剩余 18%（0x1cd810），已烧录。
+- [x] 串口冒烟：`ui images` → 37 屏/71 对象/57 唯一/0 失败；`ui menu next`×7
+  仍按快捷→人格→睡眠→系统→设备信息→时间天气→音乐播放循环，`ui menu home`
+  正常；无 panic/assert。
+- [~] 目视验收：需用户确认设备信息页下半区三个胶囊已消失；该区域留白，待 C
+  阶段填入真实情绪/预览状态。
+- [ ] C 阶段（暂停，见上一条“情绪标签探针”）：情绪标签方案已证伪；
+  需等 O2.0/服务端情绪事件。预览期间暂停状态机收敛；入口放回也依赖此通道。
+
+## 本轮：天气城市 + 信息去重 + 左右滑动切页（2026-11-14，已烧录/待目视）
+
+- 需求：天气/温度前增加地区；各菜单页不重复显示同一信息；触摸左右滑切换上一页/下一页。
+- [x] 时间天气页新增城市：位于天气图标左侧、与温度同一行；新增
+  `panda_ui_set_weather_city()`，`app_weather` 取数成功时写入城市，
+  `app_core_settings_changed()` 启动/改设置时先用缓存/配置城市填充（离线也显示）。
+- [x] 地区中文显示：geocoding 已带 `language=zh`，`parse_geocode()` 现在解析
+  `results[0].name`（如 Changzhou→常州市）并作为显示名；英文/拼音查询可命中，
+  中文“常州”直接查询 Open-Meteo 无结果，因此保留配置原文、单独缓存中文显示名。
+  中文名写入 NVS `wx_label`，重启/离线也显示中文；CLI `weather set`、
+  `settings set weather_city` 与配网页改城市时清空缓存，下一次取数重填。
+- [x] 整行居中：城市/图标/温度放进透明 flex 行（300×30，y=144，flex center，
+  pad_column=6），城市宽度改为 `LV_SIZE_CONTENT`，换城市名时自动重新居中；
+  图标与温度 reparent 进该行，温度宽度同样改为自适应。
+- [x] 去重：
+  - 快捷设置删除“亮度/音量”tile（系统设置已有可操作滑块与百分比；音量另有 KEY1/2），
+    剩余 Wi-Fi/勿扰/睡眠 三个 tile 重排为一行（x=-86/0/86，图标 y=-20、文字 y=34）。
+  - 系统设置删除“网络 Wi-Fi 已连接”行（快捷设置 Wi-Fi tile 已显示状态），
+    “时间同步”上移到原网络行的 y=24。
+- [x] 菜单左右滑切页：`panda_ui` 新增 `menu_step(delta)` 与 `panda_ui_menu_prev()`；
+  七个菜单页移除 SquareLine 生成的固定手势回调（右滑回首页/回固定页），
+  改为统一 `menu_gesture_cb`：左滑=下一页、右滑=上一页（循环）、上滑=回主屏。
+- [x] 修复手势分发前置条件（关键）：LVGL 9.5 的 `indev_gesture()` 从按下对象
+  向上爬，只要对象带 `LV_OBJ_FLAG_GESTURE_BUBBLE` 就继续，最终把事件发给
+  第一个不带 flag 的对象。原 `add_gesture_bubble()` 把屏幕根节点也加上了 flag，
+  爬升越过屏幕到 NULL → 所有生成页/菜单页手势实际都收不到。现改为只给子对象
+  补 flag、目标屏幕保持不带；音乐页同样由子控件冒泡到页面根节点。
+- [x] 修复中文名持久化崩溃：首次实现直接在天气任务里 `panda_settings_save()`，
+  该任务栈由 `xTaskCreatePinnedToCoreWithCaps(MALLOC_CAP_SPIRAM)` 分配，NVS 读
+  flash 时禁用 cache 导致 PSRAM 栈不可访问，触发
+  `assert esp_task_stack_is_sane_cache_disabled()` 并 coredump。现改为天气任务只把
+  中文名放进 `s_label_pending`，由 app_core 任务（内部栈）每秒消费并通过
+  `app_weather_take_city_label()` 持久化。
+- [x] 构建：`idf.py build` → 0x8327C0，factory 剩余 18%（0x1cd840），已烧录
+  （含中文地名、flex 居中与崩溃修复的最终镜像）。
+- [x] 主机校验：`make -C tools/ui_sim test` 46/46 通过；`check_coverage.py` PASS
+  （CJK16 8371 字形，UI 非 ASCII 395 字）。
+- [x] 串口验证（烧录后）：
+  - `ui menu next` ×8：快捷→人格→睡眠→系统→设备信息→时间天气→音乐播放→快捷（循环）；
+  - `ui menu prev` ×2：从音乐播放回时间天气、再到设备信息；`ui menu home` → 主屏；
+  - `key 3` 仍从主屏进入快捷设置并继续到人格设置（单次 1ms）；
+  - 天气在线取数：`weather: Changzhou 18°C 毛毛雨 (code 51)`，城市字符串已送入 UI；
+  - `touch left|right` 注入只打印 `touch action swipe_*`，页面不切换
+    （`app_core` 不消费滑动，避免与 LVGL 手势双触发）。
+- [x] 手势修复后重新烧录冒烟：开机 4.5s 内 `ui ready (37 screens)`、触摸就绪；
+  `ui menu next` → `menu: 快捷设置`，`ui menu prev` → `menu: 音乐播放`
+  （同时进入音乐页、起播后退出停止），`ui menu home` → `menu: home`；
+  `weather show` 返回 `no data yet (city=Changzhou)`（当时 WiFi 未连上，
+  城市来源已就位）。
+- [x] 中文地名与持久化（最终镜像）：
+  - `weather: 常州市 18°C 毛毛雨 (code 51)`；`weather show` →
+    `weather: 常州市 18°C 毛毛雨 code=51`；
+  - `app: weather city label cached: 常州市`；`settings show` →
+    `weather_city=Changzhou label=常州市`；
+  - 复位后开机日志 `weather_city=Changzhou label=常州市`（离线/重启仍是中文）；
+  - 修复后连续运行 >40s 无 panic/assert。
+- [~] 视觉/触控验收：城市/图标/温度整行居中效果、三 tile 布局、系统设置空档、
+  真实左右滑是否切页且不误触按钮，需用户目视/上手确认。左右滑目前的证据只到
+  “事件能到达屏幕”的源码路径（`lv_indev.c:1781/1815`），真手指滑动待用户验证。
+- 未验证/风险：城市用 `ui_font_CJK16`（16px），与右侧 18px 温度有 2px 字号差；
+  极长地名（>6 字）在圆边可能贴边，目前不截断；滑动手势依赖 LVGL 手势阈值（约 50px），
+  与 `panda_touch` 自身 45px 判定并存，`app_core` 不消费左右滑以避免双触发。
+- 阻塞：无（仅剩视觉/触控人工验收）。
+
+## 本轮：真深睡 + BOOT 唤醒（2026-11-14，深睡入口已验证，唤醒待按键）
+
+- 需求：休眠改为真深睡、屏幕灭、只留一颗灯、按键唤醒。
+- 硬件结论：KEY1–3 与触摸都接在 TCA9555（I2C 扩展）上，板上没有 INT 线到 ESP32；
+  深睡时 I2C 与数字域断电，只能靠 RTC GPIO 唤醒 → **唯一可用唤醒键是 BOOT(GPIO0)**。
+  WS2812 在 GPIO38（非 RTC GPIO），深睡期间无法刷新 → 呼吸动画物理上做不到，
+  改为睡前锁存第 1 颗极暗绿灯（数据线 hold 低）。
+- [x] `panda_board`：`panda_board_rgb_sleep_indicator()` 锁存暗灯、detach RMT、
+  GPIO38 hold 低；`rgb_init` 释放上次深睡留下的 hold。
+- [x] `panda_display`：`panda_display_prepare_deep_sleep()` 面板 off、背光 0、
+  GPIO5 hold 低；`display_init` 释放 hold。
+- [x] `panda_led`：`panda_led_prepare_deep_sleep()` 用互斥锁冻结动画任务后再写
+  暗灯，避免睡眠态 1s 清屏把指示灯覆盖掉。
+- [x] `app_core`：菜单睡眠/自动休眠/`ui sleep` 统一走
+  `app_core_request_deep_sleep()`：1.5s 睡眠屏 → 停配网/WiFi/语音/MP3/PA、
+  存设置、卸 SD、关屏、锁暗灯、等 BOOT 松开 → `ext0` GPIO0 低唤醒 →
+  `esp_deep_sleep_start()`；开机打印 `woke from deep sleep`。
+- [x] 睡眠设置页：隐藏“触摸/语音/都可以”，固定显示唯一唤醒键 `BOOT`。
+- [x] 构建：`idf.py build` → 0x831f90，factory 剩余 18%（0x1ce070），已烧录。
+- [x] 深睡入口真机验证（`ui sleep`）：
+  `deep sleep requested (cli)` → `screen idle -> sleep` →
+  `provisioning page stopped` → `STA disconnected reason=8 (left AP)` →
+  `display off (backlight held low)` → `/dev/ttyACM0` 消失（USB-JTAG 随数字域断电）。
+- [x] 唤醒验证（人工轻按 BOOT）：
+  `main: woke from deep sleep (cause=2, BOOT)` → `boot complete` →
+  `screen boot -> reconnecting` → `wifi connected ip=192.168.1.23`；
+  `status` 显示 `display brightness=100%`、`rgb=ok`、`sd=mounted`，
+  `max_gap=244ms`（启动基线）。短按未进下载模式。
+- [~] 暗灯观感/电流：代码已锁存第 1 颗 (3,8,4) 暗绿并 hold 数据线，
+  但“深睡时是否真的常亮”需用户目视确认（取决于灯带供电轨是否保持）。
+  若灯灭：说明该轨随深睡断电，改回全灭并在 README 写明。
+- [~] BOOT 长按边界：本次为轻按唤醒；按住跨过 ROM strapping 采样是否进下载
+  模式未测。若发生，需长按复位或评估飞线 RTC GPIO/浅睡轮询方案。
+
+## 上一轮：KEY3 切页卡死（音乐页阻塞 app_core）（2026-11-14，构建通过/待烧录）
+
+- 根因：进音乐页时 `panda_mp3_scan()`（46 个文件、ID3 标题各读两遍）和
+  `panda_mp3_play()` 在 `app_core` 任务里同步执行；离开时要 `panda_mp3_stop()`
+  （写端 800ms 收尾 + 解码任务 3s 退出）。该任务同时采样 KEY1/2/3 与触摸，
+  于是切页“卡死”数秒且期间按键丢失；此前日志已有“进音乐页约 2s loop stall”。
+- [x] `app_core`：新增独立 `music_ctrl` 任务（prio 3、5KB、core1、300ms）负责
+  扫描/播放/停止/页面刷新/灯环同步；`app_core` 主循环不再碰 SD 与音频阻塞路径。
+- [x] `panda_mp3`：扫描加互斥锁（配网页上传回调与菜单页可能并发重建全局表）；
+  ID3 标题改为排序后只读一遍（原先读两遍，扫描耗时减半）。
+- [x] `panda_mp3`：停止后清掉 `s_done` 残留 token；`play` 在旧任务未退出时
+  返回超时而不是再起一个 worker（两个 worker 共用 `s_stage`/环形缓冲会互相踩）。
+- [x] 计时日志：`menu page: <页名> (N ms)`、`music page entered (... scan N ms)`、
+  `mp3 play: ... (N ms)`、`music page left, playback stopped (N ms)`。
+- [x] `panda_ui`：菜单内维护当前页索引，修复两次按键间隔小于一次动画启动
+  tick 时第二按重复选同一页；菜单页改为 `lv_screen_load()` 即时切换（不再淡入），
+  快速连按不会叠加屏幕动画、显示锁等待从 100–440ms 降到 0–22ms。
+- [x] 构建：`idf.py build` → 0x82f600，factory 剩余 18%（0x1d0a00），已烧录。
+- [x] 真机验证（`/dev/ttyACM0`，串口注入 `key 3`）：
+  - 30 次 450ms + 40 次 120ms 连按：70 次全部按序落页（快捷→…→音乐→快捷…），
+    单次处理 0–22ms；`max_gap=240ms` 为启动期电池阶段，连按期间无新增 stall。
+  - 音乐页进入 `scan 821–1324 ms`（后台任务）、`mp3 play: ESP_OK (0 ms)`、
+    `audio_rate=44100 underruns=0`；离开 `playback stopped 234 ms`，回到 16kHz。
+  - 连按穿过音乐页：`music page left during scan; playback not started` 与
+    `playback stopped (0 ms)` 正常，无残留播放。
+- [!] 观察：改即时切换前的两轮极速连按中，各出现一次整机静默（串口 0 字节、
+  无新 coredump、无 panic），重新复位后恢复；改为即时切换后 70 次连按未再复现。
+  若复现：记录 `rst:` 原因与串口原始日志，区分屏幕淡入动画/QSPI 刷新卡死与按键逻辑。
+- [x] 文档：`tech_notes.md` §21、`PROGRESS.md` 交接日志、`README.md` 行为说明。
+
+## 上一轮：KEY3 切页去掉页面名 toast（2026-11-14，构建通过/待烧录）
+
+- [x] `app_core` KEY3 短按只切页并保留 `menu page: <名称>` 日志，不再调用
+  `panda_ui_toast(page, 800)`；长按“返回主屏”提示保持不变。
+- [x] 构建：`idf.py build` → 0x82f350，factory 剩余 18%（0x1d0cb0）。
+- [~] 真机验证：连按 KEY3 七个页面应直接切换、前台不再出现页面名胶囊。
+  缺口：设备当前未枚举 `/dev/ttyACM0`；补验：插回后烧录，`key 3`×7 观察屏幕，
+  日志仍应有 `menu page: 快捷设置…音乐播放`。
+- [x] 文档：`tech_notes.md` §20 记录本改动；`PROGRESS.md` 已追加交接日志。
 
 ## 本轮：RGB 灯环状态联动（2026-11-13，真机串口验证）
 
@@ -396,6 +608,11 @@
 
 - [~] panda_audio：ES8311/ES7210、I2S 全双工；麦克风与喇叭均已接通，
   `voice clip` 12/12 轮播放日志正常，爆音/卡死的听感待用户确认
+- [x] 功放空闲噪声（2026-11-14）：分段实验定位为 PA 通电底噪
+  （PA 关安静；PA 开+DAC 静音仍滋滋）。改为“写 PCM 时才开 PA，空闲 800ms
+  先静音 DAC 再关 PA，勿扰立即关断”；真机 `audio status` 空闲 `out=off`、
+  播放 `out=on`，用户确认空闲完全安静。播放中残余底噪与修复前相近，来自
+  功放通电本身，软件无解（需硬件改善供电/滤波）。构建 `0x8353d0`（18% free）。
 - [ ] 音频自检：tone、loopback、mic RMS、音量（`audio test` 仅有弱校验）
 - [~] panda_settings：NVS 配置（WiFi/豆包/音量/亮度/人格/反馈/动画/睡眠/勿扰/天气城市）
   已接入；默认 `api_mode` 已改为 `json`（NVS 清空场景待复测）
@@ -403,7 +620,16 @@
   已加入 ps off/指数退避/全信道扫描/AP 自动回退，fallback AP 在 STA 恢复后 5s 自动关闭
   （关闭分支待路由器断网实测）；配网页随 SoftAP 启停
 - [x] panda_voice（JSON）：测试音频→commit→ASR/TTS→回复文本已验证，两轮连续可用
-- [ ] panda_voice（O2.0）：官方二进制协议未实现，需控制台 app_id/access_key
+- [x] panda_voice（O2.0）：二进制协议层与 `app_voice` 分支已实现，构建
+  `0x835000`（18% free），主机帧/gzip 测试通过。2026-11-14 配置凭证后真机验证：
+  `O2 connection started` → `O2 StartSession sent (632B)` → `O2 session started`
+  → `asr: 你是谁呀？你叫什么名字？` → `tts done ... status=0`；真机触摸 PTT
+  （“唱首歌听听”）通过；`voice cancel`（FinishSession）后 `voice clip` 自动
+  重建会话并完成下一轮；`voice stats underruns=0 ring_drops=0 rx_overflow=0`。
+  - 修掉 WS 任务栈溢出：建会话的 7KB 临时缓冲改 PSRAM（连上即崩溃重启）。
+  - 修掉长回复音频丢失：`RING_SAMPLES` 256K→768K（约 48s），43s TTS 修复前
+    丢 293933 样本；>48s 仍会丢尾。
+  - 未验：新环形缓冲下的真实超长回复；O2 说话中再按 PTT 的真机听感。
 - [~] 触摸 PTT：长按已接 `app_voice`（BOOT 改为配网专用，不再触发 PTT）；
   真人语音识别已验证，触摸时序仍需逐项验收
 - [~] 流式 TTS 播放 + 24k→16k：已按 demo 换成多相重采样 + 500ms 预缓冲 + 淡入淡出 +

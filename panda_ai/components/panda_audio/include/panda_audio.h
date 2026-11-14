@@ -25,6 +25,10 @@ uint32_t panda_audio_get_rate(void);
 esp_err_t panda_audio_set_volume(int percent);
 esp_err_t panda_audio_get_volume(int *percent);
 esp_err_t panda_audio_mute(bool mute);
+/* Cuts the PA (the idle noise source) once OUTPUT_IDLE_MS passed without a
+ * write. Safe to call from a periodic loop; does nothing while audio plays. */
+void panda_audio_poll(void);
+bool panda_audio_output_on(void);
 /* Peak of the last written PCM block, 0..100 (pre-volume, 0 while muted).
  * Updated by every panda_audio_play() call, so TTS and MP3 share it. */
 int panda_audio_get_output_level(void);

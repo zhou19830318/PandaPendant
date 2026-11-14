@@ -3,6 +3,7 @@
 #include "panda_audio.h"
 #include "panda_connectivity.h"
 #include "voice_resampler.h"
+#include "o2_protocol.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,10 +27,19 @@
 static const char *TAG = "voice";
 
 #define VOICE_WSS_URI "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"
+#define O2_WSS_URI "wss://openspeech.bytedance.com/api/v3/realtime/dialogue"
+#define O2_RESOURCE_ID_DEFAULT "volc.speech.dialog"
+/* Public app key required by the O2 endpoint (same value as the vendor demo). */
+#define O2_APP_KEY_DEFAULT "PlgvMymc7f3tQnJ6"
+#define O2_MODEL "1.2.1.1"
+#define O2_RX_CAP (128 * 1024)
+#define O2_INFLATE_CAP (64 * 1024)
 #define DEFAULT_VOICE "zh_female_xiaohe_uranus_bigtts"
 #define FRAME_SAMPLES 640
 #define WIRE_SAMPLES 320
-#define RING_SAMPLES (256 * 1024)
+/* O2 TTS arrives much faster than realtime (a 43 s reply burst in ~10 s),
+ * so the ring must hold a whole long reply: 768K samples @16 kHz ≈ 48 s. */
+#define RING_SAMPLES (768 * 1024)
 #define RX_CAP (192 * 1024)
 #define PCM24_CAP (96 * 1024)
 #define PCM16_CAP (64 * 1024)
@@ -101,6 +111,7 @@ static QueueHandle_t s_tx_q;
 typedef struct {
     uint16_t len;
     uint8_t critical; /* commit/cancel must not be dropped; retried */
+    uint8_t binary;   /* O2 framing is sent as a binary websocket message */
     char data[TX_FRAME_CAP];
 } tx_frame_t;
 static StaticQueue_t s_tx_q_struct;
@@ -116,16 +127,30 @@ static size_t s_rx_len;
 static char *s_tx;
 static uint8_t *s_pcm24;
 static int16_t *s_pcm16;
-static char s_headers[320];
+static char s_headers[800];
 static char s_session_id[40];
+/* O2.0 binary transport state. The bytes are reassembled here because the
+ * websocket client hands us 4 KB fragments; one server frame can span many. */
+static bool s_o2_mode;
+static bool s_o2_conn_ready;
+static bool s_o2_restart_pending;
+static bool s_o2_prompt_pending;
+static uint8_t *s_o2_rx;
+static size_t s_o2_rx_len;
+static uint8_t *s_o2_payload;
+/* 0x0 continuation fragments carry no type; remember the first fragment's. */
+static bool s_ws_binary_msg;
 static uint32_t s_event_seq = 1;
 static uint32_t s_audio_deltas;
+static uint32_t s_audio_samples;
 static uint32_t s_tx_frames;
 static bool s_reply_started;
 static bool s_reply_done;
 static bool s_asr_done;
 static uint32_t s_asr_deltas;
 static volatile bool s_clip_active;
+static bool s_clip_pending;
+static esp_err_t start_test_clip(void);
 static volatile bool s_cancel_pending;
 static volatile bool s_rx_skip;
 static const uint8_t *s_clip_pcm;
@@ -218,6 +243,8 @@ static void json_escape(char *dst, size_t cap, const char *src)
     dst[out] = '\0';
 }
 
+static void append_text(char *dst, size_t cap, const char *src);
+
 /* Personality/feedback menu choices are mapped into the session instructions
  * so the persisted settings actually change how the model talks. */
 static void build_persona(char *out, size_t cap)
@@ -235,7 +262,10 @@ static void build_persona(char *out, size_t cap)
     const panda_settings_t *cfg = panda_settings_get();
     int p = cfg->personality >= 0 && cfg->personality <= 2 ? cfg->personality : 1;
     int f = cfg->feedback >= 0 && cfg->feedback <= 2 ? cfg->feedback : 1;
-    snprintf(out, cap, "%s%s%s", styles[p], feedbacks[f], cfg->persona);
+    out[0] = '\0';
+    append_text(out, cap, styles[p]);
+    append_text(out, cap, feedbacks[f]);
+    append_text(out, cap, cfg->persona);
 }
 
 static void gen_uuid(char out[37])
@@ -578,9 +608,19 @@ static esp_err_t ws_send_now(const char *buf, size_t len)
     return sent == (int)len ? ESP_OK : ESP_FAIL;
 }
 
+static esp_err_t ws_send_bin_now(const uint8_t *buf, size_t len)
+{
+    if (!s_ws || !s_ws_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    int sent = esp_websocket_client_send_bin(s_ws, (const char *)buf, (int)len,
+                                             pdMS_TO_TICKS(TX_LOCK_WAIT_MS));
+    return sent == (int)len ? ESP_OK : ESP_FAIL;
+}
+
 /* Producers never touch the ws client lock: enqueue a copy and let the TX
  * task drain it. Returns TIMEOUT when the queue is full (dropped frame). */
-static esp_err_t tx_enqueue(const char *buf, size_t len, bool critical)
+static esp_err_t tx_enqueue_ex(const char *buf, size_t len, bool critical, bool binary)
 {
     if (!s_tx_q) {
         return ESP_ERR_INVALID_STATE;
@@ -591,8 +631,14 @@ static esp_err_t tx_enqueue(const char *buf, size_t len, bool critical)
     tx_frame_t frame;
     frame.len = (uint16_t)len;
     frame.critical = critical;
+    frame.binary = binary;
     memcpy(frame.data, buf, len);
     return xQueueSend(s_tx_q, &frame, pdMS_TO_TICKS(10)) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t tx_enqueue(const char *buf, size_t len, bool critical)
+{
+    return tx_enqueue_ex(buf, len, critical, false);
 }
 
 static void tx_task(void *arg)
@@ -610,8 +656,11 @@ static void tx_task(void *arg)
         int sent = -1;
         int attempts = frame.critical ? 4 : 1;
         for (int i = 0; i < attempts; i++) {
-            sent = esp_websocket_client_send_text(s_ws, frame.data, frame.len,
-                                                  pdMS_TO_TICKS(TX_LOCK_WAIT_MS));
+            sent = frame.binary
+                       ? esp_websocket_client_send_bin(s_ws, frame.data, frame.len,
+                                                       pdMS_TO_TICKS(TX_LOCK_WAIT_MS))
+                       : esp_websocket_client_send_text(s_ws, frame.data, frame.len,
+                                                        pdMS_TO_TICKS(TX_LOCK_WAIT_MS));
             if (sent == (int)frame.len) {
                 break;
             }
@@ -629,8 +678,89 @@ static void tx_task(void *arg)
     }
 }
 
+static esp_err_t o2_send_start_connection(void)
+{
+    size_t len = 0;
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    esp_err_t err = o2_build_start_connection((uint8_t *)s_tx, TX_CAP, &len);
+    if (err == ESP_OK) {
+        err = ws_send_bin_now((const uint8_t *)s_tx, len);
+    }
+    xSemaphoreGive(s_tx_lock);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "O2 StartConnection failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "O2 StartConnection sent (%u bytes)", (unsigned)len);
+    }
+    return err;
+}
+
+static esp_err_t send_session_create_o2(void)
+{
+    if (!s_o2_conn_ready) {
+        ESP_LOGW(TAG, "O2 connection not ready; StartSession deferred");
+        return ESP_ERR_INVALID_STATE;
+    }
+    const panda_settings_t *cfg = panda_settings_get();
+    /* Called from the 8KB websocket task; keep the big JSON buffers off-stack. */
+    enum { PLAIN_CAP = 800, PERSONA_CAP = 2200, CONFIG_CAP = 4096 };
+    char *persona_plain = heap_caps_malloc(PLAIN_CAP, MALLOC_CAP_SPIRAM);
+    char *persona = heap_caps_malloc(PERSONA_CAP, MALLOC_CAP_SPIRAM);
+    char *config = heap_caps_malloc(CONFIG_CAP, MALLOC_CAP_SPIRAM);
+    if (!persona_plain || !persona || !config) {
+        ESP_LOGE(TAG, "O2 session buffers alloc failed");
+        free(persona_plain);
+        free(persona);
+        free(config);
+        return ESP_ERR_NO_MEM;
+    }
+    build_persona(persona_plain, PLAIN_CAP);
+    json_escape(persona, PERSONA_CAP, persona_plain);
+    const char *voice = cfg->speaker[0] ? cfg->speaker : DEFAULT_VOICE;
+
+    int n = snprintf(config, CONFIG_CAP,
+                     "{\"asr\":{\"extra\":{\"end_smooth_window_ms\":1500}},"
+                     "\"tts\":{\"speaker\":\"%s\",\"audio_config\":{"
+                     "\"channel\":1,\"format\":\"pcm_s16le\",\"sample_rate\":24000}},"
+                     "\"dialog\":{\"bot_name\":\"豆包\",\"system_role\":\"%s\","
+                     "\"extra\":{\"input_mod\":\"audio\","
+                     "\"enable_loudness_norm\":true,\"recv_timeout\":30,"
+                     "\"model\":\"%s\"}}}",
+                     voice, persona, O2_MODEL);
+    if (n <= 0 || (size_t)n >= CONFIG_CAP) {
+        ESP_LOGE(TAG, "O2 session config too long (%d)", n);
+        free(persona_plain);
+        free(persona);
+        free(config);
+        return ESP_ERR_NO_MEM;
+    }
+
+    gen_uuid(s_session_id);
+    size_t frame_len = 0;
+    xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+    esp_err_t err = o2_build_start_session((uint8_t *)s_tx, TX_CAP, &frame_len,
+                                           s_session_id, config);
+    if (err == ESP_OK) {
+        err = ws_send_bin_now((const uint8_t *)s_tx, frame_len);
+    }
+    if (err == ESP_OK) {
+        s_session_pending = true;
+        ESP_LOGI(TAG, "O2 StartSession sent (%u bytes, config %d)", (unsigned)frame_len, n);
+    } else {
+        ESP_LOGE(TAG, "O2 StartSession failed: %s", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_tx_lock);
+    free(persona_plain);
+    free(persona);
+    free(config);
+    return err;
+}
+
 static esp_err_t send_session_create(void)
 {
+    if (s_o2_mode) {
+        return send_session_create_o2();
+    }
     const panda_settings_t *cfg = panda_settings_get();
     char persona[2200];
     char persona_plain[800];
@@ -667,6 +797,20 @@ static esp_err_t send_session_create(void)
 
 static esp_err_t send_audio_append(const int16_t *pcm, size_t samples)
 {
+    if (s_o2_mode) {
+        if (!s_session_active) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+        size_t len = 0;
+        esp_err_t err = o2_build_audio((uint8_t *)s_tx, TX_CAP, &len, s_session_id,
+                                       pcm, samples);
+        if (err == ESP_OK) {
+            err = tx_enqueue_ex(s_tx, len, false, true);
+        }
+        xSemaphoreGive(s_tx_lock);
+        return err;
+    }
     xSemaphoreTake(s_tx_lock, portMAX_DELAY);
     int n = snprintf(s_tx, TX_CAP,
                      "{\"event_id\":\"event_%u\",\"type\":\"input_audio_buffer.append\",\"audio\":\"",
@@ -693,6 +837,11 @@ static esp_err_t send_audio_append(const int16_t *pcm, size_t samples)
 
 static esp_err_t send_commit(void)
 {
+    if (s_o2_mode) {
+        /* The O2 server owns end-of-speech detection; explicit commits are
+         * not part of the binary protocol. */
+        return ESP_OK;
+    }
     xSemaphoreTake(s_tx_lock, portMAX_DELAY);
     int n = snprintf(s_tx, TX_CAP,
                      "{\"event_id\":\"event_%u\",\"type\":\"input_audio_buffer.commit\"}",
@@ -704,6 +853,25 @@ static esp_err_t send_commit(void)
 
 static esp_err_t send_cancel(void)
 {
+    if (s_o2_mode) {
+        if (!s_session_active || !s_session_id[0]) {
+            /* FinishSession without a session id is rejected by the server;
+             * there is nothing to close before StartSession completes. */
+            return ESP_ERR_INVALID_STATE;
+        }
+        size_t len = 0;
+        xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+        esp_err_t err = o2_build_finish_session((uint8_t *)s_tx, TX_CAP, &len,
+                                                s_session_id);
+        if (err == ESP_OK) {
+            err = tx_enqueue_ex(s_tx, len, true, true);
+        }
+        xSemaphoreGive(s_tx_lock);
+        s_session_active = false;
+        s_session_pending = false;
+        ESP_LOGI(TAG, "O2 FinishSession queued (%s)", esp_err_to_name(err));
+        return err;
+    }
     static const char cancel[] = "{\"type\":\"response.cancel\"}";
     xSemaphoreTake(s_tx_lock, portMAX_DELAY);
     esp_err_t err = tx_enqueue(cancel, sizeof(cancel) - 1, true);
@@ -803,6 +971,17 @@ static esp_err_t send_text_turn(const char *text)
     if (!s_ws_connected || !s_session_active) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_o2_mode) {
+        size_t len = 0;
+        xSemaphoreTake(s_tx_lock, portMAX_DELAY);
+        esp_err_t err = o2_build_text_query((uint8_t *)s_tx, TX_CAP, &len,
+                                            s_session_id, text);
+        if (err == ESP_OK) {
+            err = tx_enqueue_ex(s_tx, len, true, true);
+        }
+        xSemaphoreGive(s_tx_lock);
+        return err;
+    }
     char esc[512];
     char frame[768];
     char speech_id[40];
@@ -846,6 +1025,18 @@ static bool prompt_no_speech(const char *why)
         return false;
     }
     if (!s_ws_connected || !s_session_active) {
+        /* O2 has no response.cancel: a canceled turn closes the session, so
+         * the reminder waits for a fresh StartSession instead of being lost. */
+        if (s_o2_mode && s_ws_connected && s_o2_conn_ready && !s_session_pending) {
+            send_session_create();
+            s_o2_prompt_pending = true;
+            s_prompt_turn = true;
+            s_prompt_sent_ms = now;
+            s_silent_until_ms = now + SILENT_GRACE_MS;
+            voice_state(PANDA_VOICE_THINKING);
+            ESP_LOGI(TAG, "no-speech prompt queued for new O2 session (%s)", why);
+            return true;
+        }
         ESP_LOGI(TAG, "no-speech prompt skipped (%s)", why);
         return false;
     }
@@ -914,6 +1105,10 @@ static void handle_json(const char *json, size_t len)
             voice_state(PANDA_VOICE_LISTENING);
         } else {
             voice_state(PANDA_VOICE_IDLE);
+        }
+        if (s_clip_pending) {
+            s_clip_pending = false;
+            start_test_clip();
         }
     } else if (!strcmp(type, "session.closed")) {
         s_session_active = false;
@@ -1025,6 +1220,7 @@ static void handle_json(const char *json, size_t len)
         s_play_drain = false;
         s_play_active = false;
         s_audio_deltas = 0;
+        s_audio_samples = 0;
         ring_reset();
         resample_reset();
         voice_state(PANDA_VOICE_SPEAKING);
@@ -1044,6 +1240,7 @@ static void handle_json(const char *json, size_t len)
                                                  olen / 2, s_pcm16,
                                                  PCM16_CAP / sizeof(int16_t));
             ring_push(s_pcm16, out);
+            s_audio_samples += (uint32_t)(olen / 2);
             s_audio_deltas++;
             s_audio_started = true;
             /* No UI call per delta: SPEAKING is set once in started, and
@@ -1063,8 +1260,8 @@ static void handle_json(const char *json, size_t len)
          * the ring and then reports idle. */
         s_audio_started = false;
         s_play_drain = true;
-        ESP_LOGI(TAG, "tts done deltas=%u ring=%u", (unsigned)s_audio_deltas,
-                 (unsigned)ring_count());
+        ESP_LOGI(TAG, "tts done deltas=%u ring=%u audio=%ums", (unsigned)s_audio_deltas,
+                 (unsigned)ring_count(), (unsigned)(s_audio_samples * 1000u / 24000u));
     } else if (!strcmp(type, "response.done")) {
         prompt_response_finished();
         s_audio_started = false;
@@ -1194,6 +1391,389 @@ static void feed_json(const char *data, size_t len)
     }
 }
 
+static const uint8_t *o2_decode(const o2_frame_t *f, size_t *len)
+{
+    if (f->compression == O2_COMP_GZIP) {
+        if (!s_o2_payload) {
+            return NULL;
+        }
+        int n = o2_inflate(f->payload, f->payload_len, s_o2_payload, O2_INFLATE_CAP - 1);
+        if (n < 0) {
+            return NULL;
+        }
+        s_o2_payload[n] = 0;
+        *len = (size_t)n;
+        return s_o2_payload;
+    }
+    *len = f->payload_len;
+    return f->payload;
+}
+
+static cJSON *o2_json(const o2_frame_t *f)
+{
+    if (f->serialization != O2_SERIAL_JSON || f->payload_len == 0) {
+        return NULL;
+    }
+    size_t len = 0;
+    const uint8_t *p = o2_decode(f, &len);
+    return p ? cJSON_ParseWithLength((const char *)p, len) : NULL;
+}
+
+static void o2_on_asr_info(void)
+{
+    if (s_no_speech_turn) {
+        return;
+    }
+    s_asr_text[0] = '\0';
+    s_asr_done = false;
+    s_asr_deltas = 0;
+    if (s_audio_started || s_play_active || ring_count() > 0) {
+        /* User barged in: drop the rest of the current reply locally. The
+         * server stops its own response on the new utterance. */
+        s_cancel_pending = true;
+        s_cancel_play = true;
+        s_play_drain = false;
+        s_play_active = false;
+        s_audio_started = false;
+        resample_reset();
+    }
+    voice_state(PANDA_VOICE_LISTENING);
+}
+
+static void o2_on_asr_response(const char *text)
+{
+    if (s_no_speech_turn || s_asr_done || !text[0] || !strcmp(text, s_asr_text)) {
+        return;
+    }
+    size_t prev = strlen(s_asr_text);
+    const char *delta = text;
+    if (prev && strncmp(text, s_asr_text, prev) == 0) {
+        delta = text + prev;
+    }
+    snprintf(s_asr_text, sizeof(s_asr_text), "%s", text);
+    if (delta[0] && ++s_asr_deltas <= 12) {
+        ESP_LOGI(TAG, "asr delta #%u '%s'", (unsigned)s_asr_deltas, delta);
+    }
+}
+
+static void o2_on_asr_ended(void)
+{
+    if (s_no_speech_turn) {
+        ESP_LOGI(TAG, "asr ended (muted: no-speech turn)");
+        return;
+    }
+    s_asr_done = true;
+    if (s_asr_text[0] == '\0') {
+        s_no_speech_turn = true;
+        answer_no_speech("empty transcript", true);
+    } else {
+        app_core_on_subtitle(s_asr_text);
+        voice_state(PANDA_VOICE_THINKING);
+        ESP_LOGI(TAG, "asr: %s", s_asr_text);
+    }
+}
+
+static void o2_on_audio_started(cJSON *root)
+{
+    if (s_no_speech_turn || (!s_prompt_turn && within_silent_grace())) {
+        s_no_speech_turn = true;
+        answer_no_speech("tts started on silent turn", true);
+        return;
+    }
+    s_cancel_pending = false;
+    s_cancel_play = false;
+    s_audio_started = true;
+    s_play_drain = false;
+    s_play_active = false;
+    s_audio_deltas = 0;
+    s_audio_samples = 0;
+    ring_reset();
+    resample_reset();
+    voice_state(PANDA_VOICE_SPEAKING);
+    cJSON *tts_type = root ? cJSON_GetObjectItemCaseSensitive(root, "tts_type") : NULL;
+    ESP_LOGI(TAG, "tts started voice=%s",
+             (tts_type && cJSON_IsString(tts_type)) ? tts_type->valuestring : "o2");
+}
+
+static void o2_on_audio(const o2_frame_t *f)
+{
+    if (s_cancel_pending || s_no_speech_turn) {
+        return;
+    }
+    size_t len = 0;
+    const uint8_t *p = o2_decode(f, &len);
+    if (!p || len < 2) {
+        return;
+    }
+    if (((uintptr_t)p & 1) != 0) {
+        ESP_LOGW(TAG, "o2 audio misaligned, dropped");
+        return;
+    }
+    size_t out = voice_resampler_process(&s_rs, (const int16_t *)p, len / 2,
+                                         s_pcm16, PCM16_CAP / sizeof(int16_t));
+    ring_push(s_pcm16, out);
+    s_audio_samples += (uint32_t)(len / 2);
+    s_audio_deltas++;
+    s_audio_started = true;
+    if ((s_audio_deltas % 25) == 0) {
+        ESP_LOGI(TAG, "tts deltas=%u ring=%u", (unsigned)s_audio_deltas,
+                 (unsigned)ring_count());
+    }
+}
+
+static void o2_on_audio_done(cJSON *root)
+{
+    int status = 0;
+    cJSON *sc = root ? cJSON_GetObjectItemCaseSensitive(root, "status_code") : NULL;
+    if (sc && cJSON_IsNumber(sc)) {
+        status = sc->valueint;
+    } else if (sc && cJSON_IsString(sc)) {
+        status = atoi(sc->valuestring);
+    }
+    s_audio_started = false;
+    s_play_drain = true;
+    prompt_response_finished();
+    ESP_LOGI(TAG, "tts done deltas=%u ring=%u audio=%ums status=%d",
+             (unsigned)s_audio_deltas, (unsigned)ring_count(),
+             (unsigned)(s_audio_samples * 1000u / 24000u), status);
+}
+
+static void o2_on_chat_response(const char *content)
+{
+    if (s_no_speech_turn || !content[0]) {
+        return;
+    }
+    if (!s_reply_started) {
+        s_reply_text[0] = '\0';
+        s_reply_started = true;
+    }
+    merge_text(s_reply_text, sizeof(s_reply_text), content);
+    app_core_on_subtitle(s_reply_text);
+    ESP_LOGI(TAG, "reply(%u bytes): %s", (unsigned)strlen(s_reply_text), s_reply_text);
+}
+
+static void o2_on_chat_ended(void)
+{
+    s_reply_done = true;
+    prompt_response_finished();
+    if (s_reply_text[0]) {
+        app_core_on_subtitle(s_reply_text);
+    }
+    ESP_LOGI(TAG, "chat ended reply(%u bytes)", (unsigned)strlen(s_reply_text));
+}
+
+static void o2_on_session_started(void)
+{
+    s_session_active = true;
+    s_session_pending = false;
+    ESP_LOGI(TAG, "O2 session started id=%.36s", s_session_id);
+    if (s_pending_capture) {
+        s_pending_capture = false;
+        s_capture = true;
+        voice_state(PANDA_VOICE_LISTENING);
+    } else {
+        voice_state(PANDA_VOICE_IDLE);
+    }
+    if (s_clip_pending) {
+        s_clip_pending = false;
+        start_test_clip();
+    }
+    if (s_o2_prompt_pending) {
+        s_o2_prompt_pending = false;
+        if (send_text_turn(NO_SPEECH_PROMPT) == ESP_OK) {
+            ESP_LOGI(TAG, "no-speech prompt sent on new O2 session");
+        } else {
+            ESP_LOGW(TAG, "no-speech prompt send failed after session start");
+            s_prompt_turn = false;
+        }
+    }
+}
+
+static void o2_on_session_finished(void)
+{
+    s_session_active = false;
+    s_session_pending = false;
+    s_capture = false;
+    ESP_LOGI(TAG, "O2 session finished");
+    if (s_o2_restart_pending) {
+        s_o2_restart_pending = false;
+        if (send_session_create() != ESP_OK) {
+            s_pending_capture = false;
+            voice_state(PANDA_VOICE_IDLE);
+        }
+    } else {
+        voice_state(PANDA_VOICE_IDLE);
+    }
+}
+
+static void o2_on_error(uint32_t code, const char *msg)
+{
+    if (s_no_speech_turn || (!s_prompt_turn && within_silent_grace())) {
+        ESP_LOGI(TAG, "O2 error muted (silent turn): %" PRIu32 " %s", code, msg);
+        s_no_speech_turn = true;
+        s_session_pending = false;
+        answer_no_speech("server error on silent turn", true);
+        return;
+    }
+    if (s_prompt_turn) {
+        ESP_LOGW(TAG, "no-speech prompt failed: %" PRIu32 " %s", code, msg);
+        s_prompt_turn = false;
+        s_session_pending = false;
+        voice_state(PANDA_VOICE_IDLE);
+        return;
+    }
+    ESP_LOGE(TAG, "O2 error %" PRIu32 " %s", code, msg);
+    voice_state(PANDA_VOICE_ERROR);
+    panda_ui_toast(msg[0] ? msg : "语音服务错误", 2000);
+    s_session_pending = false;
+}
+
+static void o2_handle_frame(const o2_frame_t *f)
+{
+    if (f->message_type == O2_MSG_SERVER_ERROR) {
+        char msg[160];
+        size_t n = f->payload_len < sizeof(msg) - 1 ? f->payload_len : sizeof(msg) - 1;
+        memcpy(msg, f->payload, n);
+        msg[n] = '\0';
+        o2_on_error(f->event_id, msg);
+        return;
+    }
+    if (f->message_type != O2_MSG_SERVER_FULL && f->message_type != O2_MSG_SERVER_ACK) {
+        ESP_LOGD(TAG, "o2 frame type=%u event=%" PRIu32, f->message_type, f->event_id);
+        return;
+    }
+    if (f->serialization == O2_SERIAL_NONE) {
+        o2_on_audio(f);
+        return;
+    }
+
+    ESP_LOGD(TAG, "o2 event %" PRIu32 " (%u bytes)", f->event_id,
+             (unsigned)f->payload_len);
+    cJSON *root = o2_json(f);
+    switch (f->event_id) {
+    case O2_EVT_CONN_STARTED:
+        ESP_LOGI(TAG, "O2 connection started");
+        s_o2_conn_ready = true;
+        if (!s_session_active && !s_session_pending) {
+            send_session_create();
+        }
+        break;
+    case O2_EVT_CONN_FAILED:
+        ESP_LOGW(TAG, "O2 connection failed");
+        o2_on_error(O2_EVT_CONN_FAILED, "connection failed");
+        break;
+    case O2_EVT_CONN_FINISHED:
+        ESP_LOGI(TAG, "O2 connection finished");
+        s_o2_conn_ready = false;
+        break;
+    case O2_EVT_SESSION_STARTED:
+        o2_on_session_started();
+        break;
+    case O2_EVT_SESSION_FINISHED:
+        o2_on_session_finished();
+        break;
+    case O2_EVT_SESSION_FAILED:
+        s_session_pending = false;
+        o2_on_error(O2_EVT_SESSION_FAILED, "session failed");
+        break;
+    case O2_EVT_USAGE:
+        ESP_LOGD(TAG, "O2 usage response");
+        break;
+    case O2_EVT_ASR_INFO:
+        o2_on_asr_info();
+        break;
+    case O2_EVT_ASR_RESPONSE:
+        if (root) {
+            cJSON *results = cJSON_GetObjectItemCaseSensitive(root, "results");
+            cJSON *first = (results && cJSON_IsArray(results) && cJSON_GetArraySize(results) > 0)
+                               ? cJSON_GetArrayItem(results, 0)
+                               : NULL;
+            cJSON *text = first ? cJSON_GetObjectItemCaseSensitive(first, "text") : NULL;
+            if (text && cJSON_IsString(text)) {
+                o2_on_asr_response(text->valuestring);
+            }
+        }
+        break;
+    case O2_EVT_ASR_ENDED:
+        o2_on_asr_ended();
+        break;
+    case O2_EVT_TTS_SENTENCE_START:
+        o2_on_audio_started(root);
+        break;
+    case O2_EVT_TTS_SENTENCE_END:
+        ESP_LOGD(TAG, "O2 tts sentence end");
+        break;
+    case O2_EVT_TTS_RESPONSE:
+        o2_on_audio(f);
+        break;
+    case O2_EVT_TTS_ENDED:
+        o2_on_audio_done(root);
+        break;
+    case O2_EVT_CHAT_RESPONSE:
+        if (root) {
+            cJSON *content = cJSON_GetObjectItemCaseSensitive(root, "content");
+            if (content && cJSON_IsString(content)) {
+                o2_on_chat_response(content->valuestring);
+            }
+        }
+        break;
+    case O2_EVT_CHAT_QUERY_CONFIRMED:
+        ESP_LOGD(TAG, "O2 text query confirmed");
+        break;
+    case O2_EVT_CHAT_ENDED:
+        o2_on_chat_ended();
+        break;
+    default:
+        ESP_LOGD(TAG, "o2 unhandled event %" PRIu32, f->event_id);
+        break;
+    }
+    if (root) {
+        cJSON_Delete(root);
+    }
+}
+
+static void o2_feed(const uint8_t *data, size_t len)
+{
+    if (!s_o2_rx) {
+        return;
+    }
+    if (len >= O2_RX_CAP) {
+        s_stat_rx_overflows++;
+        return;
+    }
+    if (s_o2_rx_len + len > O2_RX_CAP) {
+        s_stat_rx_overflows++;
+        size_t drop = s_o2_rx_len + len - O2_RX_CAP;
+        if (drop >= s_o2_rx_len) {
+            s_o2_rx_len = 0;
+        } else {
+            memmove(s_o2_rx, s_o2_rx + drop, s_o2_rx_len - drop);
+            s_o2_rx_len -= drop;
+        }
+    }
+    memcpy(s_o2_rx + s_o2_rx_len, data, len);
+    s_o2_rx_len += len;
+
+    while (s_o2_rx_len >= 4) {
+        o2_frame_t f;
+        size_t consumed = 0;
+        esp_err_t err = o2_parse_frame(s_o2_rx, s_o2_rx_len, &f, &consumed);
+        if (err == ESP_ERR_INVALID_SIZE) {
+            break;
+        }
+        if (err != ESP_OK) {
+            s_stat_rx_overflows++;
+            ESP_LOGW(TAG, "o2 bad frame (err=%s, %u buffered), resync",
+                     esp_err_to_name(err), (unsigned)s_o2_rx_len);
+            s_o2_rx_len = 0;
+            break;
+        }
+        o2_handle_frame(&f);
+        memmove(s_o2_rx, s_o2_rx + consumed, s_o2_rx_len - consumed);
+        s_o2_rx_len -= consumed;
+    }
+}
+
 static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
@@ -1210,6 +1790,10 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         s_cancel_pending = false;
         s_rx_len = 0;
         s_rx_skip = false;
+        s_o2_rx_len = 0;
+        s_o2_conn_ready = false;
+        s_o2_restart_pending = false;
+        s_ws_binary_msg = false;
         s_audio_started = false;
         s_play_drain = false;
         s_play_active = false;
@@ -1229,7 +1813,11 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
             esp_websocket_client_set_ping_interval_sec(s_ws, 30);
         }
         voice_state(PANDA_VOICE_CONNECTING);
-        send_session_create();
+        if (s_o2_mode) {
+            o2_send_start_connection();
+        } else {
+            send_session_create();
+        }
         break;
     case WEBSOCKET_EVENT_ERROR:
         /* The component fires ERROR for every error-level log, including a
@@ -1245,8 +1833,14 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         s_session_active = false;
         s_session_pending = false;
         s_pending_capture = false;
+        s_clip_pending = false;
         s_capture = false;
         s_cancel_pending = false;
+        s_o2_conn_ready = false;
+        s_o2_rx_len = 0;
+        s_o2_restart_pending = false;
+        s_o2_prompt_pending = false;
+        s_ws_binary_msg = false;
         s_audio_started = false;
         s_play_drain = false;
         s_play_active = false;
@@ -1271,10 +1865,20 @@ static void ws_event_handler(void *arg, esp_event_base_t base, int32_t id, void 
         voice_state(PANDA_VOICE_OFFLINE);
         break;
     case WEBSOCKET_EVENT_DATA:
-        /* 0x1 = text frame, 0x0 = continuation of a fragmented frame. The
-         * old code only accepted 0x1, so large JSON events split by the
-         * server were silently discarded. */
-        if (ev && (ev->op_code == 0x1 || ev->op_code == 0x0) && ev->data_len > 0) {
+        if (!ev || ev->data_len <= 0) {
+            break;
+        }
+        if (ev->op_code == 0x1 || ev->op_code == 0x2) {
+            s_ws_binary_msg = (ev->op_code == 0x2);
+        }
+        if (s_ws_binary_msg) {
+            if (s_o2_mode) {
+                o2_feed((const uint8_t *)ev->data_ptr, (size_t)ev->data_len);
+            }
+        } else {
+            /* 0x1 = text frame, 0x0 = continuation of a fragmented frame. The
+             * old code only accepted 0x1, so large JSON events split by the
+             * server were silently discarded. */
             feed_json(ev->data_ptr, (size_t)ev->data_len);
         }
         break;
@@ -1427,11 +2031,13 @@ esp_err_t app_voice_start(void)
         return ESP_OK;
     }
     const panda_settings_t *cfg = panda_settings_get();
-    if (strcmp(cfg->api_mode, "o2") == 0) {
-        ESP_LOGW(TAG, "api_mode=o2 not implemented; set api_mode=json");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (!cfg->api_key[0]) {
+    s_o2_mode = strcmp(cfg->api_mode, "o2") == 0;
+    if (s_o2_mode) {
+        if (!cfg->app_id[0] || !cfg->access_key[0]) {
+            ESP_LOGW(TAG, "api_mode=o2 needs app_id and access_key; set them first");
+            return ESP_ERR_INVALID_STATE;
+        }
+    } else if (!cfg->api_key[0]) {
         ESP_LOGW(TAG, "api_key empty; configure settings first");
         return ESP_ERR_INVALID_STATE;
     }
@@ -1447,6 +2053,10 @@ esp_err_t app_voice_start(void)
         s_tx = heap_caps_malloc(TX_CAP, MALLOC_CAP_SPIRAM);
         s_pcm24 = heap_caps_malloc(PCM24_CAP, MALLOC_CAP_SPIRAM);
         s_pcm16 = heap_caps_malloc(PCM16_CAP, MALLOC_CAP_SPIRAM);
+        if (s_o2_mode) {
+            s_o2_rx = heap_caps_malloc(O2_RX_CAP, MALLOC_CAP_SPIRAM);
+            s_o2_payload = heap_caps_malloc(O2_INFLATE_CAP, MALLOC_CAP_SPIRAM);
+        }
         s_ring_lock = xSemaphoreCreateMutex();
         s_tx_lock = xSemaphoreCreateMutex();
         /* Static queue in PSRAM: 8 pending frames would otherwise cost ~8 KB
@@ -1459,7 +2069,7 @@ esp_err_t app_voice_start(void)
         }
     }
     if (!s_ring || !s_rx || !s_tx || !s_pcm24 || !s_pcm16 || !s_ring_lock ||
-        !s_tx_lock || !s_tx_q) {
+        !s_tx_lock || !s_tx_q || (s_o2_mode && (!s_o2_rx || !s_o2_payload))) {
         ESP_LOGE(TAG, "PSRAM buffers unavailable");
         return ESP_ERR_NO_MEM;
     }
@@ -1467,12 +2077,34 @@ esp_err_t app_voice_start(void)
     resample_reset();
     s_rx_len = 0;
     s_rx_skip = false;
+    s_o2_rx_len = 0;
     s_cancel_play = false;
     s_play_running = true;
 
-    snprintf(s_headers, sizeof(s_headers), "X-Api-Key: %s\r\n", cfg->api_key);
+    if (s_o2_mode) {
+        char connect_id[48];
+        snprintf(connect_id, sizeof(connect_id), "%08" PRIx32 "-%04x-%04x",
+                 esp_random(), (unsigned)(esp_random() & 0xFFFF),
+                 (unsigned)(esp_random() & 0xFFFF));
+        snprintf(s_headers, sizeof(s_headers),
+                 "X-Api-App-ID: %s\r\n"
+                 "X-Api-Access-Key: %s\r\n"
+                 "X-Api-Resource-Id: %s\r\n"
+                 "X-Api-App-Key: %s\r\n"
+                 "X-Api-Connect-Id: %s\r\n",
+                 cfg->app_id, cfg->access_key,
+                 cfg->resource_id[0] ? cfg->resource_id : O2_RESOURCE_ID_DEFAULT,
+                 cfg->app_key[0] ? cfg->app_key : O2_APP_KEY_DEFAULT,
+                 connect_id);
+        ESP_LOGI(TAG, "O2 mode: app_id=%s resource=%s connect_id=%s",
+                 panda_settings_masked(cfg->app_id),
+                 cfg->resource_id[0] ? cfg->resource_id : O2_RESOURCE_ID_DEFAULT,
+                 connect_id);
+    } else {
+        snprintf(s_headers, sizeof(s_headers), "X-Api-Key: %s\r\n", cfg->api_key);
+    }
     esp_websocket_client_config_t ws_cfg = {
-        .uri = VOICE_WSS_URI,
+        .uri = s_o2_mode ? O2_WSS_URI : VOICE_WSS_URI,
         .headers = s_headers,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .transport = WEBSOCKET_TRANSPORT_OVER_TCP,
@@ -1512,7 +2144,8 @@ esp_err_t app_voice_start(void)
     if (s_tx_task == NULL) {
         xTaskCreate(tx_task, "voice_tx", 4096, NULL, 8, &s_tx_task);
     }
-    ESP_LOGI(TAG, "voice client started (JSON mode, model=%s)", cfg->model);
+    ESP_LOGI(TAG, "voice client started (%s mode, model=%s)",
+             s_o2_mode ? "O2" : "JSON", s_o2_mode ? O2_MODEL : cfg->model);
     return ESP_OK;
 }
 
@@ -1547,11 +2180,8 @@ void app_voice_set_pump(bool enabled)
     ESP_LOGI(TAG, "uplink silence pump %s", enabled ? "on" : "off");
 }
 
-esp_err_t app_voice_send_test_clip(void)
+static esp_err_t start_test_clip(void)
 {
-    if (!s_ws_connected || !s_session_active) {
-        return ESP_ERR_INVALID_STATE;
-    }
     if (!s_clip_pcm && !load_test_clip()) {
         return ESP_ERR_NOT_FOUND;
     }
@@ -1565,6 +2195,25 @@ esp_err_t app_voice_send_test_clip(void)
     voice_state(PANDA_VOICE_LISTENING);
     ESP_LOGI(TAG, "test clip: %u samples", (unsigned)s_clip_samples);
     return ESP_OK;
+}
+
+esp_err_t app_voice_send_test_clip(void)
+{
+    if (!s_ws_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_session_active) {
+        if (!s_session_pending) {
+            esp_err_t err = send_session_create();
+            if (err != ESP_OK) {
+                return err;
+            }
+        }
+        s_clip_pending = true;
+        ESP_LOGI(TAG, "test clip queued until the session is ready");
+        return ESP_OK;
+    }
+    return start_test_clip();
 }
 
 void app_voice_ptt_press(void)
@@ -1597,13 +2246,29 @@ void app_voice_ptt_press(void)
         return;
     }
     s_clip_active = false;
+    s_clip_pending = false;
     if (s_audio_started || ring_count() > 0 || s_play_active) {
         /* Barge-in: let the play task ramp down and flush instead of cutting
          * the waveform at an arbitrary sample (an audible click). */
         s_cancel_pending = true;
-        send_cancel();
         s_cancel_play = true;
         resample_reset();
+        send_cancel();
+        if (s_o2_mode) {
+            /* O2 interrupt == FinishSession; the new session is opened when
+             * the server acks 152, then capture resumes in LISTENING. */
+            s_o2_restart_pending = true;
+            s_pending_capture = true;
+            s_capture = false;
+            s_asr_text[0] = '\0';
+            s_reply_text[0] = '\0';
+            s_reply_started = false;
+            s_reply_done = false;
+            s_asr_done = false;
+            s_asr_deltas = 0;
+            voice_state(PANDA_VOICE_CONNECTING);
+            return;
+        }
     }
     s_asr_text[0] = '\0';
     s_reply_text[0] = '\0';
@@ -1656,6 +2321,7 @@ esp_err_t app_voice_cancel(void)
     s_capture = false;
     s_pending_capture = false;
     s_clip_active = false;
+    s_clip_pending = false;
     s_cancel_pending = true;
     s_cancel_play = true;
     resample_reset();
@@ -1667,6 +2333,8 @@ esp_err_t app_voice_cancel(void)
     s_no_speech_turn = false;
     s_prompt_turn = false;
     s_silent_until_ms = 0;
+    s_o2_restart_pending = false;
+    s_o2_prompt_pending = false;
     voice_state(PANDA_VOICE_IDLE);
     if (!s_ws_connected) {
         return ESP_ERR_INVALID_STATE;
@@ -1705,6 +2373,10 @@ void app_voice_set_network(bool online)
     s_no_speech_turn = false;
     s_prompt_turn = false;
     s_silent_until_ms = 0;
+    s_o2_conn_ready = false;
+    s_o2_rx_len = 0;
+    s_o2_restart_pending = false;
+    s_o2_prompt_pending = false;
     resample_reset();
     voice_state(PANDA_VOICE_OFFLINE);
 }

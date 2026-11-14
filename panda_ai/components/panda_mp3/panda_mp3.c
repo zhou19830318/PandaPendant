@@ -55,6 +55,9 @@ static size_t s_ring_head;
 static size_t s_ring_tail;
 static size_t s_ring_count;
 static SemaphoreHandle_t s_ring_lock;
+/* The config page upload handler and the menu music page can scan at the
+ * same time; the tables are globals, so serialize the rebuild. */
+static SemaphoreHandle_t s_scan_lock;
 static volatile bool s_primed;  /* prebuffer reached, writer may start */
 static volatile bool s_eof;     /* decoder reached the end of this file */
 static volatile bool s_tx_idle; /* writer empty and DMA drained */
@@ -203,7 +206,7 @@ static void track_title(const char *path, const char *name, char *out, size_t ca
     }
 }
 
-int panda_mp3_scan(void)
+static int scan_locked(void)
 {
     if (s_task != NULL) {
         return s_count;
@@ -232,9 +235,6 @@ int panda_mp3_scan(void)
             continue;
         }
         snprintf(s_files[s_count], PANDA_MP3_NAME_MAX, "%s", ent->d_name);
-        char path[192];
-        snprintf(path, sizeof(path), "%s/%s", s_dir, ent->d_name);
-        track_title(path, ent->d_name, s_titles[s_count], PANDA_MP3_NAME_MAX);
         s_count++;
     }
     closedir(dir);
@@ -249,7 +249,8 @@ int panda_mp3_scan(void)
         }
         memcpy(s_files[j + 1], tmp, sizeof(tmp));
     }
-    /* Titles were read before sorting; redo them so title[i] matches file[i]. */
+    /* Read the ID3 tag only once, after sorting, so title[i] matches file[i].
+     * Each read is an SD open plus up to 64 KB and dominates the scan time. */
     for (int i = 0; i < s_count; i++) {
         char path[192];
         snprintf(path, sizeof(path), "%.95s/%.95s", s_dir, s_files[i]);
@@ -258,6 +259,19 @@ int panda_mp3_scan(void)
 
     ESP_LOGI(TAG, "found %d track(s) in %s", s_count, s_dir);
     return s_count;
+}
+
+int panda_mp3_scan(void)
+{
+    if (s_scan_lock == NULL) {
+        return scan_locked();
+    }
+    /* The config page upload handler and the menu worker can scan at the
+     * same time; s_files/s_titles are globals, so rebuild them serially. */
+    xSemaphoreTake(s_scan_lock, portMAX_DELAY);
+    int count = scan_locked();
+    xSemaphoreGive(s_scan_lock);
+    return count;
 }
 
 int panda_mp3_count(void)
@@ -768,12 +782,13 @@ esp_err_t panda_mp3_init(void)
     s_ctrl = xSemaphoreCreateMutex();
     s_done = xSemaphoreCreateBinary();
     s_ring_lock = xSemaphoreCreateMutex();
+    s_scan_lock = xSemaphoreCreateMutex();
     s_ring = heap_caps_malloc(MP3_RING_SAMPLES * sizeof(int16_t),
                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_stage = heap_caps_malloc(MP3_CHUNK_SAMPLES * sizeof(int16_t),
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_ctrl == NULL || s_done == NULL || s_ring_lock == NULL ||
-        s_ring == NULL || s_stage == NULL) {
+        s_scan_lock == NULL || s_ring == NULL || s_stage == NULL) {
         return ESP_ERR_NO_MEM;
     }
     s_tx_idle = true;
@@ -795,6 +810,10 @@ esp_err_t panda_mp3_stop(void)
     }
     xSemaphoreTake(s_ctrl, portMAX_DELAY);
     if (s_task == NULL) {
+        /* A stop that timed out earlier can leave the worker's completion
+         * token behind; drop it so the next stop cannot consume it and
+         * report success while the worker is still alive. */
+        xSemaphoreTake(s_done, 0);
         xSemaphoreGive(s_ctrl);
         s_state = PANDA_MP3_IDLE;
         return ESP_OK;
@@ -828,8 +847,15 @@ esp_err_t panda_mp3_play(int index)
         return ESP_ERR_INVALID_STATE;
     }
     if (s_task != NULL) {
-        panda_mp3_stop();
+        esp_err_t serr = panda_mp3_stop();
+        if (serr != ESP_OK || s_task != NULL) {
+            /* Starting a second worker would share s_stage and the ring with
+             * the old one, corrupting both. Fail instead. */
+            ESP_LOGW(TAG, "previous worker did not stop (%s)", esp_err_to_name(serr));
+            return serr != ESP_OK ? serr : ESP_ERR_TIMEOUT;
+        }
     }
+    xSemaphoreTake(s_done, 0);
     if (s_count <= 0 && panda_mp3_scan() <= 0) {
         return ESP_ERR_NOT_FOUND;
     }

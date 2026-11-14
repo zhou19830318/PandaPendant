@@ -22,6 +22,8 @@ void app_core_set_time_from_epoch(time_t epoch);
 /* Re-apply persisted settings to hardware and refresh the menu UI. Called
  * after CLI / provisioning changes settings outside the UI callbacks. */
 void app_core_settings_changed(void);
+/* Show the sleep face for 1.5 s, then enter deep sleep (BOOT/GPIO0 wakes). */
+void app_core_request_deep_sleep(const char *reason);
 void app_core_on_voice_state(panda_voice_ui_t state);
 void app_core_on_emotion(panda_emotion_t emotion);
 void app_core_on_subtitle(const char *text);

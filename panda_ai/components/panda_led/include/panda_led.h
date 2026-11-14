@@ -48,6 +48,9 @@ void panda_led_set_play(panda_led_play_t play, int track_index);
 void panda_led_set_network(bool connected, bool ap);
 void panda_led_set_battery(int percent, bool charging, bool present);
 void panda_led_set_sleeping(bool sleeping);
+/* Freeze the animation task and latch the single dim sleep indicator.
+ * Call once, immediately before esp_deep_sleep_start(). */
+esp_err_t panda_led_prepare_deep_sleep(void);
 
 void panda_led_notify_volume(int direction, int volume_percent);
 void panda_led_notify_wake(void);

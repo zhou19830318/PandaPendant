@@ -8,6 +8,7 @@
 #include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_sys.h"
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
@@ -536,6 +537,9 @@ esp_err_t panda_board_rgb_init(void)
     if (s_rgb) {
         return ESP_OK;
     }
+    /* A previous deep sleep may have held the strip data low. */
+    gpio_hold_dis(PANDA_RGB_GPIO);
+    gpio_deep_sleep_hold_dis();
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = PANDA_RGB_GPIO,
         .max_leds = PANDA_RGB_LEDS,
@@ -598,6 +602,31 @@ esp_err_t panda_board_rgb_off(void)
         return ESP_ERR_INVALID_STATE;
     }
     return led_strip_clear(s_rgb);
+}
+
+esp_err_t panda_board_rgb_sleep_indicator(void)
+{
+    if (!s_rgb) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t frame[PANDA_RGB_LEDS * 3] = {0};
+    /* The dimmest green the 8-bit WS2812 driver can still show evenly. */
+    frame[0] = 3;
+    frame[1] = 8;
+    frame[2] = 4;
+    esp_err_t err = panda_board_rgb_write(frame, PANDA_RGB_LEDS);
+    if (err != ESP_OK) {
+        return err;
+    }
+    esp_rom_delay_us(400); /* >280us reset: the strip latches the colour */
+    /* Detach RMT and hold the data line low, otherwise the pad floats while
+     * the digital domain is powered down and the strip can pick up noise. */
+    gpio_reset_pin(PANDA_RGB_GPIO);
+    gpio_set_direction(PANDA_RGB_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(PANDA_RGB_GPIO, 0);
+    gpio_hold_en(PANDA_RGB_GPIO);
+    gpio_deep_sleep_hold_en();
+    return ESP_OK;
 }
 
 esp_err_t panda_board_i2c_scan(void)

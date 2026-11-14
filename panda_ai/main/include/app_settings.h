@@ -52,6 +52,9 @@ typedef struct {
 
     int dnd;                        /* 0/1, mute speaker output */
     char weather_city[PANDA_CITY_MAX];
+    /* Localized name returned by the geocoder (e.g. "常州市"); cache only,
+     * refreshed on every successful fetch, never edited by the user. */
+    char weather_city_label[PANDA_CITY_MAX];
 
     char persona[PANDA_PERSONA_MAX];
 } panda_settings_t;
